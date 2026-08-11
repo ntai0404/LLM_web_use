@@ -26,7 +26,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
-            host=os.getenv("HOST", "127.0.0.1"),
+            host=os.getenv("HOST", "0.0.0.0"),
             port=int(os.getenv("PORT", "4444")),
             gemini_profile_dir=os.getenv(
                 "GEMINI_PROFILE_DIR",

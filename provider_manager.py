@@ -89,9 +89,22 @@ class ProviderManager:
     async def list_models(self, refresh: bool = False) -> list[dict[str, Any]]:
         models: list[dict[str, Any]] = []
         for provider in self.registry.all():
-            for model in await provider.list_models(refresh=refresh):
+            provider_models = await provider.list_models(refresh=refresh)
+            if not any(str(model.get("id", "")).lower() == provider.name.lower() for model in provider_models):
+                provider_models = [
+                    {
+                        "id": provider.name,
+                        "object": "model",
+                        "owned_by": provider.name,
+                        "provider": provider.name,
+                    },
+                    *provider_models,
+                ]
+            for model in provider_models:
                 item = dict(model)
                 item.setdefault("provider", provider.name)
+                item.setdefault("object", "model")
+                item.setdefault("owned_by", provider.name)
                 models.append(item)
         return models
 
