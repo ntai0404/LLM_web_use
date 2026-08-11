@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>LLM Web Router</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#dashboard" aria-label="LLM Web Router home">
+        <span class="brand-mark" aria-hidden="true">LR</span>
+        <span>
+          <strong>LLM Web Router</strong>
+          <small>Provider control plane</small>
+        </span>
+      </a>
+      <div class="service-pill" id="service-pill" aria-live="polite">
+        <span class="status-dot status-unknown"></span>
+        <span id="service-label">Connecting</span>
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="Primary navigation">
+      <nav>
+        <button class="nav-item active" data-view="dashboard" type="button">
+          <span class="nav-icon">⌂</span><span>Dashboard</span>
+        </button>
+        <button class="nav-item" data-view="providers" type="button">
+          <span class="nav-icon">◇</span><span>Providers</span>
+        </button>
+        <button class="nav-item" data-view="api" type="button">
+          <span class="nav-icon">↔</span><span>API</span>
+        </button>
+        <button class="nav-item" data-view="playground" type="button">
+          <span class="nav-icon">▷</span><span>Playground</span>
+        </button>
+      </nav>
+      <div class="sidebar-meta">
+        <span>Local only</span>
+        <code id="sidebar-endpoint">127.0.0.1:4444</code>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section class="view active" id="view-dashboard" data-title="Dashboard">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Overview</p>
+            <h1>Provider operations</h1>
+            <p>Runtime health, authentication, and browser-backed provider activity.</p>
+          </div>
+          <button class="button button-secondary" id="refresh-dashboard" type="button">Refresh status</button>
+        </div>
+
+        <div class="summary-grid" id="summary-grid" aria-live="polite">
+          <article class="summary-card"><span>Service</span><strong id="summary-service">—</strong><small id="summary-endpoint">127.0.0.1:4444</small></article>
+          <article class="summary-card"><span>Providers</span><strong id="summary-providers">—</strong><small>Registered runtimes</small></article>
+          <article class="summary-card"><span>Ready providers</span><strong id="summary-ready">—</strong><small>Available for requests</small></article>
+          <article class="summary-card"><span>Auth required</span><strong id="summary-auth">—</strong><small>Needs user action</small></article>
+        </div>
+
+        <div class="section-heading">
+          <div><p class="eyebrow">Live registry</p><h2>Provider overview</h2></div>
+          <span class="muted" id="last-refreshed">Not refreshed</span>
+        </div>
+        <div class="provider-grid" id="dashboard-providers"></div>
+      </section>
+
+      <section class="view" id="view-providers" data-title="Providers">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Registry</p>
+            <h1>Providers</h1>
+            <p>Inspect and verify registered browser-backed or API-backed runtimes.</p>
+          </div>
+          <button class="button button-secondary" id="refresh-providers" type="button">Refresh status</button>
+        </div>
+        <div class="provider-grid provider-grid-wide" id="providers-list"></div>
+      </section>
+
+      <section class="view" id="view-api" data-title="API">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Integration</p>
+            <h1>API access</h1>
+            <p>Use this service as a local LLM gateway. No API key is required.</p>
+          </div>
+        </div>
+        <div class="api-layout">
+          <article class="panel endpoint-panel">
+            <span class="panel-label">Base URL</span>
+            <div class="copy-row"><code id="api-base-url">http://127.0.0.1:4444</code><button class="copy-button" data-copy-target="api-base-url" type="button">Copy</button></div>
+            <div class="endpoint-list">
+              <div><span class="method method-post">POST</span><code>/v1/chat/completions</code><small>OpenAI-compatible</small></div>
+              <div><span class="method method-post">POST</span><code>/api/generate</code><small>Native generation</small></div>
+              <div><span class="method method-get">GET</span><code>/health</code><small>Provider health</small></div>
+            </div>
+          </article>
+          <article class="panel code-panel">
+            <div class="panel-title-row"><span class="panel-label">Python example</span><button class="copy-button" data-copy-target="python-example" type="button">Copy</button></div>
+            <pre id="python-example"><code>from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4444/v1",
+    api_key="unused"
+)
+
+response = client.chat.completions.create(
+    model="gemini-web",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+
+print(response.choices[0].message.content)</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-playground" data-title="Playground">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Public API smoke test</p>
+            <h1>Playground</h1>
+            <p>Requests flow through HTTP, Provider Manager, and the selected provider.</p>
+          </div>
+        </div>
+        <div class="playground-layout">
+          <form class="panel playground-form" id="playground-form">
+            <label for="playground-model">Provider / model</label>
+            <select id="playground-model" name="model"></select>
+            <label for="playground-prompt">Prompt</label>
+            <textarea id="playground-prompt" name="prompt" placeholder="Ask a provider..." required></textarea>
+            <div class="form-actions">
+              <span class="muted" id="prompt-count">0 characters</span>
+              <button class="button button-primary" id="playground-send" type="submit">Send request</button>
+            </div>
+          </form>
+          <article class="panel response-panel">
+            <div class="panel-title-row">
+              <span class="panel-label">Response</span>
+              <span class="latency" id="playground-latency">—</span>
+            </div>
+            <div class="response-meta" id="playground-meta">No request yet</div>
+            <pre id="playground-response" class="response-output">Response will appear here.</pre>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>LLM Web Router</span><code id="footer-endpoint">127.0.0.1:4444</code>
+    </footer>
+  </div>
+
+  <dialog class="provider-dialog" id="provider-dialog">
+    <div class="dialog-shell">
+      <div class="dialog-heading">
+        <div><p class="eyebrow">Provider detail</p><h2 id="dialog-title">Provider</h2></div>
+        <button class="icon-button" id="dialog-close" type="button" aria-label="Close provider details">×</button>
+      </div>
+      <div class="dialog-status" id="dialog-status"></div>
+      <dl class="detail-grid" id="dialog-details"></dl>
+      <div class="dialog-actions" id="dialog-actions"></div>
+      <div class="action-result" id="dialog-result" aria-live="polite"></div>
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

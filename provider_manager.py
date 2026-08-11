@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+import time
 from typing import Any
 
 from providers.base import GenerationResult, LLMProvider
@@ -105,6 +107,46 @@ class ProviderManager:
     async def trigger_keepalive(self, provider_name: str) -> dict[str, Any]:
         result = await self.registry.provider(provider_name).keepalive()
         return result.as_dict()
+
+    async def provider_list(self, refresh: bool = False) -> list[dict[str, Any]]:
+        providers: list[dict[str, Any]] = []
+        for provider in self.registry.all():
+            try:
+                providers.append(await provider.management_info(refresh=refresh))
+            except Exception as exc:
+                providers.append(
+                    {
+                        "id": provider.name,
+                        "display_name": provider.name,
+                        "provider_type": "provider",
+                        "status": "OFFLINE",
+                        "auth": "unknown",
+                        "model_aliases": sorted(provider.model_aliases),
+                        "last_error": type(exc).__name__,
+                    }
+                )
+        return providers
+
+    async def provider_detail(self, provider_name: str, refresh: bool = False) -> dict[str, Any]:
+        return await self.registry.provider(provider_name).management_info(refresh=refresh)
+
+    async def test_provider(self, provider_name: str) -> dict[str, Any]:
+        provider = self.registry.provider(provider_name)
+        nonce = f"PROVIDER_TEST_{secrets.token_hex(8).upper()}"
+        prompt = f"Reply exactly with this token and nothing else: {nonce}"
+        started = time.perf_counter()
+        result = await provider.generate(prompt, provider.name, max_output_tokens=64)
+        latency_seconds = round(time.perf_counter() - started, 3)
+        exact_match = result.text.strip() == nonce
+        return {
+            "success": exact_match,
+            "provider": provider.name,
+            "model": result.model,
+            "response": result.text,
+            "exact_match": exact_match,
+            "latency_seconds": latency_seconds,
+            "metadata": result.metadata,
+        }
 
     async def shutdown(self) -> None:
         for provider in reversed(self.registry.all()):

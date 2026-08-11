@@ -9,6 +9,8 @@ from typing import Any
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import Settings
@@ -26,6 +28,9 @@ from scheduler import ProviderScheduler
 load_dotenv()
 
 PROJECT_DIR = Path(__file__).resolve().parent
+WEB_DIR = PROJECT_DIR / "web"
+STATIC_DIR = WEB_DIR / "static"
+TEMPLATE_DIR = WEB_DIR / "templates"
 settings = Settings.from_env()
 
 
@@ -150,11 +155,45 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard():
+    return FileResponse(TEMPLATE_DIR / "index.html")
 
 
 @app.get("/health")
 async def health():
     return await manager.health_check()
+
+
+@app.get("/api/providers")
+async def providers(refresh: bool = False):
+    return {
+        "service": {
+            "host": settings.host,
+            "port": settings.port,
+            "base_url": f"http://{settings.host}:{settings.port}",
+        },
+        "providers": await manager.provider_list(refresh=refresh),
+    }
+
+
+@app.get("/api/providers/{provider_name}")
+async def provider_detail(provider_name: str, refresh: bool = False):
+    try:
+        return await manager.provider_detail(provider_name, refresh=refresh)
+    except Exception as exc:
+        raise provider_http_error(exc)
+
+
+@app.post("/api/providers/{provider_name}/test")
+async def test_provider(provider_name: str):
+    try:
+        return await manager.test_provider(provider_name)
+    except Exception as exc:
+        raise provider_http_error(exc)
 
 
 @app.get("/models")
@@ -237,6 +276,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 
 @app.post("/providers/{provider_name}/keepalive")
+@app.post("/api/providers/{provider_name}/keepalive")
 async def trigger_keepalive(provider_name: str):
     try:
         return await manager.trigger_keepalive(provider_name)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -65,6 +66,7 @@ class GeminiWebProvider(LLMProvider):
         )
         self._operation_lock = asyncio.Lock()
         self.status = ProviderStatus.OFFLINE
+        self.auth_state = "unknown"
         self.last_success: str | None = None
         self.last_keepalive: str | None = None
         self.last_keepalive_result: dict[str, Any] | None = None
@@ -87,6 +89,7 @@ class GeminiWebProvider(LLMProvider):
             )
         except AuthRequired as exc:
             self.status = ProviderStatus.AUTH_REQUIRED
+            self.auth_state = "required"
             self.last_error = "AUTH_REQUIRED"
             raise ProviderAuthRequired("Gemini Web login is required") from exc
         except GeminiWebError as exc:
@@ -99,6 +102,7 @@ class GeminiWebProvider(LLMProvider):
             raise ProviderError(str(exc)) from exc
 
         self.status = ProviderStatus.READY
+        self.auth_state = "ok"
         self.last_success = utc_now()
         self.last_error = None
         return GenerationResult(
@@ -124,15 +128,18 @@ class GeminiWebProvider(LLMProvider):
                 required = await self.client.auth_required()
             except Exception:
                 self.status = ProviderStatus.OFFLINE
+                self.auth_state = "unknown"
                 self.last_error = "BROWSER_UNAVAILABLE"
                 return "unknown"
             if required:
                 self.status = ProviderStatus.AUTH_REQUIRED
+                self.auth_state = "required"
                 self.last_error = "AUTH_REQUIRED"
                 return "required"
             if self.status in {ProviderStatus.OFFLINE, ProviderStatus.AUTH_REQUIRED}:
                 self.status = ProviderStatus.READY
             self.last_error = None
+            self.auth_state = "ok"
             return "ok"
 
     async def health_check(self) -> dict[str, Any]:
@@ -141,15 +148,18 @@ class GeminiWebProvider(LLMProvider):
             auth = str(raw.get("auth", "unknown"))
             if raw.get("ok") and auth == "ok":
                 self.status = ProviderStatus.READY
+                self.auth_state = "ok"
                 self.last_error = None
             elif auth == "required":
                 self.status = ProviderStatus.AUTH_REQUIRED
+                self.auth_state = "required"
                 self.last_error = "AUTH_REQUIRED"
             elif raw.get("url"):
                 self.status = ProviderStatus.DEGRADED
                 self.last_error = str(raw.get("error") or "HEALTH_CHECK_FAILED")
             else:
                 self.status = ProviderStatus.OFFLINE
+                self.auth_state = "unknown"
                 self.last_error = str(raw.get("error") or "BROWSER_UNAVAILABLE")
             return {
                 "status": self.status.value,
@@ -179,6 +189,7 @@ class GeminiWebProvider(LLMProvider):
             try:
                 if await self.client.auth_required():
                     self.status = ProviderStatus.AUTH_REQUIRED
+                    self.auth_state = "required"
                     self.last_error = "AUTH_REQUIRED"
                     result = KeepaliveResult(
                         success=False,
@@ -203,6 +214,7 @@ class GeminiWebProvider(LLMProvider):
                     )
                     success = exact_match and network_verified
                     self.status = ProviderStatus.READY if success else ProviderStatus.DEGRADED
+                    self.auth_state = "ok"
                     if success:
                         self.last_success = utc_now()
                         self.last_error = None
@@ -224,6 +236,7 @@ class GeminiWebProvider(LLMProvider):
                     )
             except ProviderAuthRequired:
                 self.status = ProviderStatus.AUTH_REQUIRED
+                self.auth_state = "required"
                 self.last_error = "AUTH_REQUIRED"
                 result = KeepaliveResult(
                     success=False,
@@ -267,6 +280,38 @@ class GeminiWebProvider(LLMProvider):
 
     def model_profiles(self) -> list[dict[str, Any]]:
         return self.client.reference_profiles()
+
+    async def management_info(self, refresh: bool = False) -> dict[str, Any]:
+        health = await self.health_check() if refresh else None
+        if health is not None:
+            status = health["status"]
+            auth = health["auth"]
+        else:
+            status = self.status.value
+            auth = self.auth_state
+        schedule = self.keepalive_policy
+        return {
+            "id": self.name,
+            "display_name": "Gemini Web",
+            "provider_type": "browser-backed",
+            "status": status,
+            "auth": auth,
+            "browser_runtime": "Google Chrome",
+            "headless": self.client.headless,
+            "profile": Path(self.client.profile_dir).name,
+            "model_aliases": sorted(self.model_aliases),
+            "keepalive": {
+                "enabled": schedule.enabled,
+                "strategy": "authenticated_generation",
+                "timezone": schedule.timezone,
+                "hour": schedule.hour,
+                "minute": schedule.minute,
+            },
+            "last_keepalive": self.last_keepalive,
+            "last_success": self.last_success,
+            "last_error": self.last_error,
+            "transport": "internal-stream-generate",
+        }
 
     async def shutdown(self) -> None:
         async with self._operation_lock:

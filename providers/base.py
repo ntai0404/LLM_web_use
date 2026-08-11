@@ -117,5 +117,22 @@ class LLMProvider(ABC):
     async def estimate(self, prompt: str, model: str | None = None, files: list[str] | None = None, **options: Any) -> dict[str, Any]:
         return {"provider": self.name, "available": False}
 
+    async def management_info(self, refresh: bool = False) -> dict[str, Any]:
+        health = await self.health_check() if refresh else {}
+        return {
+            "id": self.name,
+            "display_name": self.name,
+            "provider_type": "provider",
+            "model_aliases": sorted(self.model_aliases),
+            "status": health.get("status", ProviderStatus.OFFLINE.value),
+            "auth": health.get("auth", "unknown"),
+            "keepalive": {
+                "enabled": self.keepalive_policy.enabled,
+                "timezone": self.keepalive_policy.timezone,
+                "hour": self.keepalive_policy.hour,
+                "minute": self.keepalive_policy.minute,
+            },
+        }
+
     async def shutdown(self) -> None:
         return None

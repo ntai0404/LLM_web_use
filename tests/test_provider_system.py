@@ -24,6 +24,9 @@ class FakeProvider(LLMProvider):
         self.shutdown_calls = 0
 
     async def generate(self, prompt, model=None, files=None, **options):
+        marker = "Reply exactly with this token and nothing else: "
+        if marker in prompt:
+            return GenerationResult(prompt.split(marker, 1)[1], model or self.name, self.name)
         return GenerationResult(prompt.upper(), model or self.name, self.name)
 
     async def health_check(self):
@@ -152,6 +155,17 @@ class ProviderSystemTests(unittest.IsolatedAsyncioTestCase):
         await manager.shutdown()
 
         self.assertEqual(1, provider.shutdown_calls)
+
+    async def test_provider_admin_test_uses_registered_provider(self):
+        registry = ProviderRegistry()
+        registry.register(FakeProvider())
+        manager = ProviderManager(registry)
+
+        result = await manager.test_provider("fake-web")
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["exact_match"])
+        self.assertEqual("fake-web", result["provider"])
 
 
 if __name__ == "__main__":

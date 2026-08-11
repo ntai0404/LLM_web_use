@@ -33,8 +33,14 @@ python app.py serve
 
 Open:
 
+- Management UI: http://127.0.0.1:4444/
 - Health: http://127.0.0.1:4444/health
 - Models: http://127.0.0.1:4444/v1/models
+
+The lightweight management UI uses server-served HTML, CSS, and vanilla
+JavaScript. It includes provider status/details, real provider tests, manual
+keepalive, API examples, and a playground that calls the public `/api/generate`
+route through `ProviderManager`.
 
 ## 4) Direct API
 
@@ -84,7 +90,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:4444/v1/chat/completions" -Method POST 
 Manual keepalive verification:
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:4444/providers/gemini-web/keepalive" -Method POST
+Invoke-RestMethod -Uri "http://127.0.0.1:4444/api/providers/gemini-web/keepalive" -Method POST
 ```
 
 Gemini's provider-owned policy runs a real keepalive generation daily at 00:00
