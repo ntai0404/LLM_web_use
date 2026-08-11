@@ -1,0 +1,5 @@
+fastapi>=0.116,<1
+uvicorn[standard]>=0.35,<1
+playwright>=1.54,<2
+pydantic>=2.11,<3
+python-dotenv>=1.1,<2

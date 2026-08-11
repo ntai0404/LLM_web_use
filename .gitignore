@@ -1,0 +1,19 @@
+# Local environment and dependencies
+.env
+.venv/
+
+# Authenticated browser state (contains cookies/session data)
+var/
+
+# Runtime artifacts
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
