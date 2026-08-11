@@ -31,6 +31,16 @@ class ProviderUnavailable(ProviderError):
     pass
 
 
+class ProviderBusy(ProviderUnavailable):
+    pass
+
+
+class ProviderRateLimited(ProviderError):
+    def __init__(self, message: str, retry_after: str | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 @dataclass(frozen=True)
 class KeepalivePolicy:
     enabled: bool = False

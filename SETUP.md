@@ -3,8 +3,8 @@
 ## Requirements
 
 - Windows 10/11 or a comparable Python 3.11+ environment.
-- Google Chrome installed. Playwright tries the installed Chrome channel first
-  and can fall back to its managed Chromium browser.
+- Google Chrome installed. Playwright controls that native Chrome channel over
+  its CDP pipe; this runtime does not fall back to a separate Chromium binary.
 - An authenticated Gemini Web account and Internet access.
 
 Install dependencies directly with the Python interpreter that will run the
@@ -12,7 +12,6 @@ service:
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 ```
 
 ## Configuration
@@ -25,6 +24,7 @@ HOST=0.0.0.0
 PORT=4444
 GEMINI_PROFILE_DIR=var/profiles/gemini-main
 GEMINI_TIMEOUT_MS=120000
+GEMINI_QUEUE_TIMEOUT_MS=30000
 HEADLESS=true
 BROWSER_CHANNEL=chrome
 ```
@@ -102,7 +102,7 @@ python -m pytest tests/consumer -q
 
 - `port already in use`: inspect the listener with `netstat -ano | findstr 4444`.
 - `AUTH_REQUIRED`: run `python app.py bootstrap` and complete login manually.
-- `PROVIDER_UNAVAILABLE`: check Chrome/Chromium availability and profile locks.
+- `PROVIDER_UNAVAILABLE`: check Google Chrome availability and profile locks.
 - `GENERATION_TIMEOUT`: the browser-backed generation exceeded
   `GEMINI_TIMEOUT_MS`; use bounded retry with backoff, never infinite retry.
 - `UPSTREAM_ERROR`: Gemini Web returned an error; inspect the non-secret server

@@ -3,7 +3,7 @@
 ## What it is
 
 This is a modular HTTP gateway for browser-backed LLM providers. The active
-provider is `gemini-web`, which uses an authenticated persistent Chromium/Chrome
+provider is `gemini-web`, which uses an authenticated persistent native Chrome
 profile and Gemini Web's live session. Consumers call the HTTP API; they do not
 import browser or provider modules.
 
@@ -17,12 +17,11 @@ import browser or provider modules.
 
 ## Quick start
 
-Requirements: Python 3.11+, Google Chrome/Chromium, and network access to
+Requirements: Python 3.11+, Google Chrome, and network access to
 Gemini Web.
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 python app.py bootstrap
 python app.py serve
 ```

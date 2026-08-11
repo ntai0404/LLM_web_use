@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from gemini_web import AuthRequired, GeminiWebClient, GeminiWebError
+from gemini_web import AuthRequired, BrowserUnavailable, GeminiWebClient, GeminiWebError
 from providers.base import (
     GenerationResult,
     KeepalivePolicy,
     KeepaliveResult,
     LLMProvider,
     ProviderAuthRequired,
+    ProviderBusy,
     ProviderError,
+    ProviderRateLimited,
     ProviderStatus,
     ProviderTimeout,
     ProviderUnavailable,
@@ -56,6 +59,7 @@ class GeminiWebProvider(LLMProvider):
         keepalive_policy: KeepalivePolicy | None = None,
         nonce_factory: Callable[[], str] | None = None,
         operation_timeout_seconds: float = 120.0,
+        queue_timeout_seconds: float = 30.0,
     ) -> None:
         self.client = client
         self.keepalive_policy = keepalive_policy or KeepalivePolicy(
@@ -68,6 +72,7 @@ class GeminiWebProvider(LLMProvider):
             lambda: f"KEEPALIVE_{datetime.now(ZONE_BANGKOK).date().isoformat()}_{secrets.token_hex(6).upper()}"
         )
         self.operation_timeout_seconds = max(0.001, operation_timeout_seconds)
+        self.queue_timeout_seconds = max(0.001, queue_timeout_seconds)
         self._operation_lock = asyncio.Lock()
         self.status = ProviderStatus.OFFLINE
         self.auth_state = "unknown"
@@ -97,10 +102,6 @@ class GeminiWebProvider(LLMProvider):
         except asyncio.TimeoutError as exc:
             self.status = ProviderStatus.DEGRADED
             self.last_error = "GENERATION_TIMEOUT"
-            try:
-                await self.client.stop()
-            except Exception:
-                pass
             raise ProviderTimeout(
                 f"Gemini Web generation exceeded {self.operation_timeout_seconds:g} seconds"
             ) from exc
@@ -109,10 +110,24 @@ class GeminiWebProvider(LLMProvider):
             self.auth_state = "required"
             self.last_error = "AUTH_REQUIRED"
             raise ProviderAuthRequired("Gemini Web login is required") from exc
+        except BrowserUnavailable as exc:
+            self.status = ProviderStatus.OFFLINE
+            self.last_error = "BROWSER_UNAVAILABLE"
+            raise ProviderUnavailable("Google Chrome CDP runtime is unavailable") from exc
         except GeminiWebError as exc:
+            message = str(exc)
+            if re.search(r"(?:HTTP|status)\s*429\b", message, re.IGNORECASE) or re.search(
+                r"\b(rate.?limit|quota)\b", message, re.IGNORECASE
+            ):
+                self.status = ProviderStatus.DEGRADED
+                self.last_error = "RATE_LIMITED"
+                raise ProviderRateLimited(
+                    "Gemini Web rate limit reached",
+                    retry_after=self.client.last_retry_after,
+                ) from exc
             self.status = ProviderStatus.DEGRADED
             self.last_error = "GEMINI_WEB_ERROR"
-            raise ProviderError(str(exc)) from exc
+            raise ProviderError(message) from exc
         except ValueError:
             raise
         except Exception as exc:
@@ -138,8 +153,19 @@ class GeminiWebProvider(LLMProvider):
         files: list[str] | None = None,
         **options: Any,
     ) -> GenerationResult:
-        async with self._operation_lock:
+        try:
+            await asyncio.wait_for(
+                self._operation_lock.acquire(),
+                timeout=self.queue_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ProviderBusy(
+                f"Gemini browser queue remained busy for {self.queue_timeout_seconds:g} seconds"
+            ) from exc
+        try:
             return await self._generate_locked(prompt, model, files, options)
+        finally:
+            self._operation_lock.release()
 
     async def auth_status(self) -> str:
         async with self._operation_lock:
@@ -162,7 +188,13 @@ class GeminiWebProvider(LLMProvider):
             return "ok"
 
     async def health_check(self) -> dict[str, Any]:
-        async with self._operation_lock:
+        if self._operation_lock.locked():
+            return self._health_payload(busy=True)
+        try:
+            await asyncio.wait_for(self._operation_lock.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return self._health_payload(busy=True)
+        try:
             raw = await self.client.health()
             auth = str(raw.get("auth", "unknown"))
             if raw.get("ok") and auth == "ok":
@@ -180,27 +212,40 @@ class GeminiWebProvider(LLMProvider):
                 self.status = ProviderStatus.OFFLINE
                 self.auth_state = "unknown"
                 self.last_error = str(raw.get("error") or "BROWSER_UNAVAILABLE")
-            return {
-                "status": self.status.value,
-                "auth": auth,
-                "last_success": self.last_success,
-                "last_keepalive": self.last_keepalive,
-                "last_keepalive_result": self.last_keepalive_result,
-                "last_error": self.last_error,
-                "browser_headless": self.client.headless,
-                "browser_visible": not self.client.headless,
-                "transport": raw.get("transport"),
-                "last_request_host": raw.get("last_request_host"),
-                "last_request_endpoint": raw.get("last_request_endpoint"),
-                "last_http_status": raw.get("last_http_status"),
-                "last_observed_model_id": raw.get("last_observed_model_id"),
-                "keepalive_policy": {
-                    "enabled": self.keepalive_policy.enabled,
-                    "timezone": self.keepalive_policy.timezone,
-                    "hour": self.keepalive_policy.hour,
-                    "minute": self.keepalive_policy.minute,
-                },
-            }
+            return self._health_payload(raw=raw, busy=False, auth=auth)
+        finally:
+            self._operation_lock.release()
+
+    def _health_payload(
+        self,
+        raw: dict[str, Any] | None = None,
+        busy: bool = False,
+        auth: str | None = None,
+    ) -> dict[str, Any]:
+        raw = raw or {}
+        return {
+            "status": self.status.value,
+            "auth": auth or self.auth_state,
+            "busy": busy,
+            "last_success": self.last_success,
+            "last_keepalive": self.last_keepalive,
+            "last_keepalive_result": self.last_keepalive_result,
+            "last_error": self.last_error,
+            "browser_headless": self.client.headless,
+            "browser_visible": not self.client.headless,
+            "transport": raw.get("transport") or "internal-stream-generate",
+            "last_request_host": raw.get("last_request_host") or self.client.last_request_host,
+            "last_request_endpoint": raw.get("last_request_endpoint") or self.client.last_request_endpoint,
+            "last_http_status": raw.get("last_http_status") or self.client.last_http_status,
+            "last_retry_after": raw.get("last_retry_after") or self.client.last_retry_after,
+            "last_observed_model_id": raw.get("last_observed_model_id") or self.client.last_observed_model_id,
+            "keepalive_policy": {
+                "enabled": self.keepalive_policy.enabled,
+                "timezone": self.keepalive_policy.timezone,
+                "hour": self.keepalive_policy.hour,
+                "minute": self.keepalive_policy.minute,
+            },
+        }
 
     async def keepalive(self) -> KeepaliveResult:
         attempted_at = utc_now()

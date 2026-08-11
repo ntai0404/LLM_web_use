@@ -17,6 +17,7 @@ class Settings:
     port: int
     gemini_profile_dir: str
     gemini_timeout_ms: int
+    gemini_queue_timeout_ms: int
     headless: bool
     keepalive_enabled: bool
     keepalive_timezone: str
@@ -33,6 +34,9 @@ class Settings:
                 "var/profiles/gemini-main",
             ),
             gemini_timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS", "120000")),
+            gemini_queue_timeout_ms=int(
+                os.getenv("GEMINI_QUEUE_TIMEOUT_MS", "30000")
+            ),
             headless=env_bool("HEADLESS", True),
             keepalive_enabled=env_bool("GEMINI_KEEPALIVE_ENABLED", True),
             keepalive_timezone=os.getenv("GEMINI_KEEPALIVE_TIMEZONE", "Asia/Bangkok"),

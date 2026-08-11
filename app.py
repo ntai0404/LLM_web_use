@@ -13,17 +13,27 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import Settings
 from gemini_web import GeminiWebClient
+from openai_compat import (
+    ChatCompletionRequest,
+    OpenAIOutputError,
+    prepare_openai_request,
+    repair_prompt,
+    validate_structured_output,
+    validate_tool_output,
+)
 from provider_manager import ProviderManager, ProviderNotFound, ProviderRegistry
 from providers import (
     GeminiWebProvider,
     KeepalivePolicy,
     ProviderAuthRequired,
+    ProviderBusy,
     ProviderError,
+    ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
 )
@@ -54,6 +64,7 @@ def build_manager(config: Settings) -> tuple[ProviderManager, ProviderScheduler]
             minute=config.keepalive_minute,
         ),
         operation_timeout_seconds=config.gemini_timeout_ms / 1000,
+        queue_timeout_seconds=config.gemini_queue_timeout_ms / 1000,
     )
     registry.register(gemini)
     manager = ProviderManager(registry)
@@ -98,44 +109,6 @@ class GenerateRequest(BaseModel):
         return normalized
 
 
-class ChatMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["system", "user", "assistant"]
-    content: str = Field(min_length=1, max_length=4_194_304)
-
-    @field_validator("content")
-    @classmethod
-    def reject_blank_content(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("content must not be blank")
-        return value
-
-
-class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(default="gemini-web", min_length=1, max_length=200)
-    messages: list[ChatMessage] = Field(min_length=1, max_length=128)
-    stream: bool = False
-    max_tokens: int | None = Field(default=None, ge=1, le=65_536)
-    max_input_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
-
-    @field_validator("model")
-    @classmethod
-    def normalize_model(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("model must not be blank")
-        return normalized
-
-    @model_validator(mode="after")
-    def validate_total_content_size(self):
-        if sum(len(message.content) for message in self.messages) > 4_194_304:
-            raise ValueError("combined message content exceeds 4194304 characters")
-        return self
-
-
 class ErrorResponse(BaseModel):
     error: str
     message: str
@@ -152,13 +125,14 @@ class GenerateResponse(BaseModel):
 
 class ChatCompletionMessageResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: str | None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionChoiceResponse(BaseModel):
     index: int
     message: ChatCompletionMessageResponse
-    finish_reason: Literal["stop"] = "stop"
+    finish_reason: Literal["stop", "tool_calls"] = "stop"
 
 
 class ChatCompletionResponse(BaseModel):
@@ -177,17 +151,20 @@ class ApiException(Exception):
         error: str,
         message: str,
         details: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error = error
         self.message = message
         self.details = details
+        self.headers = headers or {}
 
 
 ERROR_RESPONSES = {
     400: {"model": ErrorResponse, "description": "Invalid request"},
     401: {"model": ErrorResponse, "description": "Provider authentication required"},
+    429: {"model": ErrorResponse, "description": "Provider rate limited"},
     413: {"model": ErrorResponse, "description": "Request body is too large"},
     404: {"model": ErrorResponse, "description": "Provider or route not found"},
     422: {"model": ErrorResponse, "description": "Request validation failed"},
@@ -195,18 +172,6 @@ ERROR_RESPONSES = {
     503: {"model": ErrorResponse, "description": "Provider runtime unavailable"},
     504: {"model": ErrorResponse, "description": "Provider generation timed out"},
 }
-
-
-def messages_to_prompt(messages: list[ChatMessage]) -> str:
-    parts: list[str] = []
-    for message in messages:
-        role = message.role.strip().lower()
-        label = {"system": "System", "assistant": "Assistant", "user": "User"}.get(
-            role,
-            message.role,
-        )
-        parts.append(f"{label}: {message.content}")
-    return "\n\n".join(parts)
 
 
 def resolve_project_file(raw_path: str) -> Path:
@@ -242,12 +207,17 @@ def provider_http_error(exc: Exception) -> ApiException:
         return ApiException(404, "PROVIDER_NOT_FOUND", str(exc))
     if isinstance(exc, ProviderAuthRequired):
         return ApiException(401, "AUTH_REQUIRED", str(exc))
+    if isinstance(exc, ProviderRateLimited):
+        headers = {"Retry-After": exc.retry_after} if exc.retry_after else {}
+        return ApiException(429, "RATE_LIMITED", str(exc), headers=headers)
     if isinstance(exc, ProviderTimeout):
         return ApiException(504, "GENERATION_TIMEOUT", str(exc))
+    if isinstance(exc, ProviderBusy):
+        return ApiException(503, "PROVIDER_BUSY", str(exc), headers={"Retry-After": "1"})
     if isinstance(exc, ProviderUnavailable):
         return ApiException(503, "PROVIDER_UNAVAILABLE", str(exc))
     if isinstance(exc, ValueError):
-        return ApiException(400, "INVALID_INPUT", str(exc))
+        return ApiException(422, "INVALID_REQUEST", str(exc))
     if isinstance(exc, ProviderError):
         return ApiException(502, "UPSTREAM_ERROR", str(exc))
     return ApiException(500, "INTERNAL_ERROR", "Internal server error")
@@ -290,6 +260,7 @@ def error_response(
     error: str,
     message: str,
     details: Any | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     request_id = request_id_for(request)
     content: dict[str, Any] = {
@@ -299,10 +270,12 @@ def error_response(
     }
     if details is not None:
         content["details"] = details
+    response_headers = {"X-Request-ID": request_id}
+    response_headers.update(headers or {})
     return JSONResponse(
         status_code=status_code,
         content=content,
-        headers={"X-Request-ID": request_id},
+        headers=response_headers,
     )
 
 
@@ -337,7 +310,7 @@ async def attach_request_id(request: Request, call_next):
 @app.exception_handler(ApiException)
 async def handle_api_exception(request: Request, exc: ApiException):
     return error_response(
-        request, exc.status_code, exc.error, exc.message, exc.details
+        request, exc.status_code, exc.error, exc.message, exc.details, exc.headers
     )
 
 
@@ -508,20 +481,60 @@ async def estimate(request: GenerateRequest):
     responses=ERROR_RESPONSES,
 )
 async def chat_completions(request: ChatCompletionRequest):
-    if request.stream:
-        raise ApiException(
-            400,
-            "UNSUPPORTED_OPTION",
-            "stream=true is not implemented",
-        )
     try:
-        result = await manager.generate(
-            messages_to_prompt(request.messages),
-            request.model,
-            max_input_tokens=request.max_input_tokens,
-            max_output_tokens=request.max_tokens,
-        )
+        with prepare_openai_request(request) as prepared:
+            result = await manager.generate(
+                prepared.prompt,
+                request.model,
+                files=prepared.files,
+                max_input_tokens=request.max_input_tokens,
+                max_output_tokens=request.output_token_limit,
+            )
+            content: str | None = result.text
+            tool_calls: list[dict[str, Any]] | None = None
+            finish_reason: Literal["stop", "tool_calls"] = "stop"
+
+            def validate_output(text: str):
+                if prepared.tool_plan is not None:
+                    return validate_tool_output(text, prepared.tool_plan)
+                if prepared.output_schema is not None:
+                    return (
+                        validate_structured_output(
+                            text,
+                            prepared.output_schema,
+                            prepared.require_json_object,
+                        ),
+                        None,
+                        "stop",
+                    )
+                return text, None, "stop"
+
+            if prepared.tool_plan is not None or prepared.output_schema is not None:
+                try:
+                    content, tool_calls, finish_reason = validate_output(result.text)
+                except OpenAIOutputError as first_error:
+                    repaired = await manager.generate(
+                        repair_prompt(
+                            prepared.prompt,
+                            result.text,
+                            str(first_error),
+                        ),
+                        request.model,
+                        files=prepared.files,
+                        max_input_tokens=request.max_input_tokens,
+                        max_output_tokens=request.output_token_limit,
+                    )
+                    try:
+                        content, tool_calls, finish_reason = validate_output(repaired.text)
+                    except OpenAIOutputError as second_error:
+                        raise ApiException(
+                            502,
+                            "MALFORMED_UPSTREAM_OUTPUT",
+                            str(second_error),
+                        ) from second_error
     except Exception as exc:
+        if isinstance(exc, ApiException):
+            raise
         raise provider_http_error(exc)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -531,8 +544,12 @@ async def chat_completions(request: ChatCompletionRequest):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": result.text},
-                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": finish_reason,
             }
         ],
         "usage": None,

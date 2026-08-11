@@ -444,6 +444,10 @@ class GeminiWebError(RuntimeError):
     pass
 
 
+class BrowserUnavailable(GeminiWebError):
+    pass
+
+
 class GeminiWebClient:
     def __init__(
         self,
@@ -461,6 +465,7 @@ class GeminiWebClient:
         self.last_request_host: Optional[str] = None
         self.last_request_endpoint: Optional[str] = None
         self.last_http_status: Optional[int] = None
+        self.last_retry_after: Optional[str] = None
         self.last_upload_host: Optional[str] = None
         self.last_upload_status: Optional[int] = None
         self.last_upload_count = 0
@@ -556,9 +561,10 @@ class GeminiWebClient:
 
         try:
             self._context = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
-        except Exception:
-            launch_kwargs.pop("channel", None)
-            self._context = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            await self._pw.stop()
+            self._pw = None
+            raise BrowserUnavailable("Google Chrome CDP runtime is unavailable") from exc
 
         self._context.set_default_timeout(self.timeout_ms)
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -576,6 +582,7 @@ class GeminiWebClient:
         self.last_request_host = parsed.hostname
         self.last_request_endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         self.last_http_status = response.status
+        self.last_retry_after = response.headers.get("retry-after")
         header = response.request.headers.get("x-goog-ext-525001261-jspb")
         if header:
             try:
@@ -635,6 +642,7 @@ class GeminiWebClient:
                 "last_request_host": self.last_request_host,
                 "last_request_endpoint": self.last_request_endpoint,
                 "last_http_status": self.last_http_status,
+                "last_retry_after": self.last_retry_after,
                 "last_upload_host": self.last_upload_host,
                 "last_upload_status": self.last_upload_status,
                 "last_upload_count": self.last_upload_count,

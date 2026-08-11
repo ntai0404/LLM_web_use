@@ -3,7 +3,7 @@
 ## Purpose
 
 Browser-backed LLM HTTP gateway. The active provider is Gemini Web through an
-authenticated persistent Chrome/Chromium profile.
+authenticated persistent native Chrome profile controlled over a CDP pipe.
 
 ## Runtime
 
@@ -17,7 +17,6 @@ authenticated persistent Chrome/Chromium profile.
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 python app.py bootstrap
 python app.py serve
 python -m pytest

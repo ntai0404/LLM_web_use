@@ -69,12 +69,12 @@ class ApiContractTests(unittest.TestCase):
         self.assertNotIn("detail", response.json())
         self.assertEqual("contract-json", response.headers["x-request-id"])
 
-    def test_empty_messages_and_unsupported_role_are_rejected(self):
+    def test_empty_messages_and_invalid_tool_message_are_rejected(self):
         empty = self.client.post(
             "/v1/chat/completions",
             json={"model": "gemini-web", "messages": []},
         )
-        unsupported = self.client.post(
+        invalid_tool = self.client.post(
             "/v1/chat/completions",
             json={
                 "model": "gemini-web",
@@ -84,8 +84,8 @@ class ApiContractTests(unittest.TestCase):
 
         self.assertEqual(422, empty.status_code)
         self.assertEqual("VALIDATION_ERROR", empty.json()["error"])
-        self.assertEqual(422, unsupported.status_code)
-        self.assertEqual("VALIDATION_ERROR", unsupported.json()["error"])
+        self.assertEqual(422, invalid_tool.status_code)
+        self.assertEqual("VALIDATION_ERROR", invalid_tool.json()["error"])
 
     def test_blank_prompt_is_rejected_without_provider_call(self):
         response = self.client.post(
@@ -95,18 +95,23 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(422, response.status_code)
         self.assertEqual("VALIDATION_ERROR", response.json()["error"])
 
-    def test_unknown_openai_option_is_rejected(self):
-        response = self.client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "gemini-web",
-                "messages": [{"role": "user", "content": "hello"}],
-                "temperature": 0.7,
-            },
-        )
+    def test_openai_optional_parameters_are_accepted(self):
+        with patch.object(app_module, "manager", FakeManager()):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "frequency_penalty": 0.1,
+                    "presence_penalty": 0.2,
+                    "seed": 42,
+                    "client_optional_extension": "controlled-no-op",
+                },
+            )
 
-        self.assertEqual(422, response.status_code)
-        self.assertEqual("VALIDATION_ERROR", response.json()["error"])
+        self.assertEqual(200, response.status_code)
 
     def test_router_404_uses_stable_error_contract(self):
         response = self.client.get("/does-not-exist")
@@ -166,7 +171,7 @@ class ProviderTimeoutTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProviderTimeout):
             await provider.generate("hello", "gemini-web")
 
-        self.assertEqual(1, client.stop_calls)
+        self.assertEqual(0, client.stop_calls)
         self.assertFalse(provider._operation_lock.locked())
         self.assertEqual("GENERATION_TIMEOUT", provider.last_error)
 

@@ -9,6 +9,7 @@ from providers.base import (
     KeepaliveResult,
     LLMProvider,
     ProviderStatus,
+    ProviderBusy,
 )
 from providers.gemini import GeminiWebProvider
 from scheduler import ProviderScheduler
@@ -61,6 +62,8 @@ class FakeGeminiClient:
         self.last_request_host = "gemini.google.com"
         self.last_request_endpoint = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
         self.last_http_status = 200
+        self.last_retry_after = None
+        self.last_observed_model_id = None
         self.last_call_metrics = {"duration_seconds": 0.01}
         self.stopped = False
 
@@ -145,6 +148,31 @@ class ProviderSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(ProviderStatus.AUTH_REQUIRED, result.status)
         self.assertEqual([], client.prompts)
+
+    async def test_health_is_non_blocking_while_generation_lock_is_busy(self):
+        client = FakeGeminiClient()
+        provider = GeminiWebProvider(client)
+        provider.status = ProviderStatus.READY
+        provider.auth_state = "ok"
+        await provider._operation_lock.acquire()
+        try:
+            health = await asyncio.wait_for(provider.health_check(), timeout=0.1)
+        finally:
+            provider._operation_lock.release()
+
+        self.assertTrue(health["busy"])
+        self.assertEqual("READY", health["status"])
+        self.assertEqual("ok", health["auth"])
+
+    async def test_generation_queue_has_bounded_busy_timeout(self):
+        client = FakeGeminiClient()
+        provider = GeminiWebProvider(client, queue_timeout_seconds=0.01)
+        await provider._operation_lock.acquire()
+        try:
+            with self.assertRaises(ProviderBusy):
+                await provider.generate("queued", "gemini-web")
+        finally:
+            provider._operation_lock.release()
 
     async def test_manager_shutdown_closes_provider_once(self):
         registry = ProviderRegistry()
