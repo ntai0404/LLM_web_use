@@ -16,6 +16,8 @@ from providers.base import (
     ProviderAuthRequired,
     ProviderError,
     ProviderStatus,
+    ProviderTimeout,
+    ProviderUnavailable,
 )
 
 
@@ -53,6 +55,7 @@ class GeminiWebProvider(LLMProvider):
         client: GeminiWebClient,
         keepalive_policy: KeepalivePolicy | None = None,
         nonce_factory: Callable[[], str] | None = None,
+        operation_timeout_seconds: float = 120.0,
     ) -> None:
         self.client = client
         self.keepalive_policy = keepalive_policy or KeepalivePolicy(
@@ -64,6 +67,7 @@ class GeminiWebProvider(LLMProvider):
         self._nonce_factory = nonce_factory or (
             lambda: f"KEEPALIVE_{datetime.now(ZONE_BANGKOK).date().isoformat()}_{secrets.token_hex(6).upper()}"
         )
+        self.operation_timeout_seconds = max(0.001, operation_timeout_seconds)
         self._operation_lock = asyncio.Lock()
         self.status = ProviderStatus.OFFLINE
         self.auth_state = "unknown"
@@ -80,13 +84,26 @@ class GeminiWebProvider(LLMProvider):
         options: dict[str, Any],
     ) -> GenerationResult:
         try:
-            text = await self.client.ask(
-                prompt,
-                model,
-                files=files,
-                max_input_tokens=options.get("max_input_tokens"),
-                max_output_tokens=options.get("max_output_tokens"),
+            text = await asyncio.wait_for(
+                self.client.ask(
+                    prompt,
+                    model,
+                    files=files,
+                    max_input_tokens=options.get("max_input_tokens"),
+                    max_output_tokens=options.get("max_output_tokens"),
+                ),
+                timeout=self.operation_timeout_seconds,
             )
+        except asyncio.TimeoutError as exc:
+            self.status = ProviderStatus.DEGRADED
+            self.last_error = "GENERATION_TIMEOUT"
+            try:
+                await self.client.stop()
+            except Exception:
+                pass
+            raise ProviderTimeout(
+                f"Gemini Web generation exceeded {self.operation_timeout_seconds:g} seconds"
+            ) from exc
         except AuthRequired as exc:
             self.status = ProviderStatus.AUTH_REQUIRED
             self.auth_state = "required"
@@ -96,10 +113,12 @@ class GeminiWebProvider(LLMProvider):
             self.status = ProviderStatus.DEGRADED
             self.last_error = "GEMINI_WEB_ERROR"
             raise ProviderError(str(exc)) from exc
+        except ValueError:
+            raise
         except Exception as exc:
             self.status = ProviderStatus.OFFLINE
-            self.last_error = "PROVIDER_ERROR"
-            raise ProviderError(str(exc)) from exc
+            self.last_error = "BROWSER_UNAVAILABLE"
+            raise ProviderUnavailable("Gemini Web browser runtime is unavailable") from exc
 
         self.status = ProviderStatus.READY
         self.auth_state = "ok"

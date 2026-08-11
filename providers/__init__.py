@@ -6,6 +6,8 @@ from providers.base import (
     ProviderAuthRequired,
     ProviderError,
     ProviderStatus,
+    ProviderTimeout,
+    ProviderUnavailable,
 )
 from providers.gemini import GeminiWebProvider
 
@@ -18,4 +20,6 @@ __all__ = [
     "ProviderAuthRequired",
     "ProviderError",
     "ProviderStatus",
+    "ProviderTimeout",
+    "ProviderUnavailable",
 ]

@@ -23,6 +23,14 @@ class ProviderAuthRequired(ProviderError):
     pass
 
 
+class ProviderTimeout(ProviderError):
+    pass
+
+
+class ProviderUnavailable(ProviderError):
+    pass
+
+
 @dataclass(frozen=True)
 class KeepalivePolicy:
     enabled: bool = False
