@@ -7,8 +7,8 @@
   and can fall back to its managed Chromium browser.
 - An authenticated Gemini Web account and Internet access.
 
-This repository does not require a Python virtual environment. Install with
-the interpreter that will run the service:
+Install dependencies directly with the Python interpreter that will run the
+service:
 
 ```powershell
 python -m pip install -r requirements.txt

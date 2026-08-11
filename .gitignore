@@ -1,6 +1,5 @@
 # Local environment and dependencies
 .env
-.venv/
 
 # Authenticated browser state (contains cookies/session data)
 var/
