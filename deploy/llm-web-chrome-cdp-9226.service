@@ -1,0 +1,30 @@
+[Unit]
+Description=LLM Web Integration Native Google Chrome CDP 9226
+Wants=graphical-session.target
+After=graphical-session.target
+Before=llm-web-integration.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/google-chrome-stable \
+    --password-store=basic \
+    --remote-debugging-port=9226 \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-allow-origins=* \
+    --user-data-dir=/home/cuongdo/Tainx-sourcecode/llm-web-intergration/var/profiles/gemini-main \
+    --profile-directory=Default \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-dev-shm-usage \
+    --disable-quic \
+    --new-window \
+    --window-size=1400,1000 \
+    --window-position=80,80 \
+    about:blank
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

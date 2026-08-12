@@ -1,0 +1,18 @@
+[Unit]
+Description=LLM Web Integration HTTP Gateway
+Wants=network-online.target
+After=network-online.target llm-web-chrome-cdp-9226.service
+Requires=llm-web-chrome-cdp-9226.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cuongdo/Tainx-sourcecode/llm-web-intergration
+EnvironmentFile=/home/cuongdo/Tainx-sourcecode/llm-web-intergration/.env
+ExecStart=/home/cuongdo/miniconda3/bin/python3 app.py serve
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

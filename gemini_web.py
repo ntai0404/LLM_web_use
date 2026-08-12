@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from playwright.async_api import BrowserContext, Page, Response, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
 
 
 GEMINI_URL = "https://gemini.google.com/app"
@@ -454,13 +454,20 @@ class GeminiWebClient:
         profile_dir: str = "var/gemini-profile",
         headless: bool = True,
         timeout_ms: int = 120_000,
+        cdp_url: Optional[str] = None,
     ) -> None:
         self.profile_dir = str(Path(profile_dir).resolve())
-        self.headless = headless
+        self.cdp_url = str(cdp_url or os.getenv("GEMINI_CDP_URL", "")).strip() or None
+        # A configured CDP endpoint is the visible native Chrome runtime.  Do
+        # not report it as headless merely because HEADLESS remains true for
+        # the legacy Playwright-launch path.
+        self.headless = False if self.cdp_url else headless
         self.timeout_ms = timeout_ms
         self._pw = None
+        self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._owns_context = False
         self._lock = asyncio.Lock()
         self.last_request_host: Optional[str] = None
         self.last_request_endpoint: Optional[str] = None
@@ -549,22 +556,48 @@ class GeminiWebClient:
 
         Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
         self._pw = await async_playwright().start()
-        browser_channel = os.getenv("BROWSER_CHANNEL", "chrome").strip() or None
-        launch_kwargs = {
-            "user_data_dir": self.profile_dir,
-            "headless": self.headless,
-            "viewport": {"width": 1365, "height": 900},
-            "args": ["--no-first-run", "--no-default-browser-check", "--disable-quic"],
-        }
-        if browser_channel:
-            launch_kwargs["channel"] = browser_channel
+        if self.cdp_url:
+            # Match the Vanban Agent browser lifecycle: native stable Chrome is
+            # launched independently with a real viewport/profile and this
+            # process only attaches over loopback CDP.  Never silently fall
+            # back to a Playwright-launched browser when native CDP is required.
+            try:
+                self._browser = await self._pw.chromium.connect_over_cdp(
+                    self.cdp_url,
+                    timeout=self.timeout_ms,
+                )
+                if not self._browser.contexts:
+                    raise BrowserUnavailable(
+                        f"Native Chrome CDP has no browser context: {self.cdp_url}"
+                    )
+            except Exception as exc:
+                await self._pw.stop()
+                self._pw = None
+                if isinstance(exc, BrowserUnavailable):
+                    raise
+                raise BrowserUnavailable(
+                    f"Native Chrome CDP is unavailable: {self.cdp_url}"
+                ) from exc
+            self._context = self._browser.contexts[0]
+            self._owns_context = False
+        else:
+            browser_channel = os.getenv("BROWSER_CHANNEL", "chrome").strip() or None
+            launch_kwargs = {
+                "user_data_dir": self.profile_dir,
+                "headless": self.headless,
+                "viewport": {"width": 1365, "height": 900},
+                "args": ["--no-first-run", "--no-default-browser-check", "--disable-quic"],
+            }
+            if browser_channel:
+                launch_kwargs["channel"] = browser_channel
 
-        try:
-            self._context = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
-        except Exception as exc:
-            await self._pw.stop()
-            self._pw = None
-            raise BrowserUnavailable("Google Chrome CDP runtime is unavailable") from exc
+            try:
+                self._context = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+            except Exception as exc:
+                await self._pw.stop()
+                self._pw = None
+                raise BrowserUnavailable("Google Chrome runtime is unavailable") from exc
+            self._owns_context = True
 
         self._context.set_default_timeout(self.timeout_ms)
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -593,10 +626,12 @@ class GeminiWebClient:
                 self.last_observed_model_id = None
 
     async def stop(self) -> None:
-        if self._context is not None:
+        if self._context is not None and self._owns_context:
             await self._context.close()
         self._context = None
         self._page = None
+        self._browser = None
+        self._owns_context = False
         if self._pw is not None:
             await self._pw.stop()
         self._pw = None
