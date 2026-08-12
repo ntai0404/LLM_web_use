@@ -1,14 +1,16 @@
 import base64
+import copy
 import json
 import os
 import unittest
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 import app as app_module
+from tests.asgi_client import ASGITestClient
 from providers import (
     ProviderBusy,
     ProviderRateLimited,
@@ -42,6 +44,18 @@ class CapturingManager:
             metadata={},
         )
 
+    @asynccontextmanager
+    async def generation_session(self, model):
+        async def generate(prompt, session_model=None, files=None, **options):
+            return await self.generate(
+                prompt,
+                session_model or model,
+                files=files,
+                **options,
+            )
+
+        yield generate
+
 
 class BrowserAction(BaseModel):
     click_element: dict[str, int]
@@ -58,7 +72,7 @@ class BrowserAgentOutput(BaseModel):
 class OpenAIBrowserUseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app_module.app)
+        cls.client = ASGITestClient(app_module.app)
 
     def test_default_agent_parameters_are_noop_compatible_and_max_tokens_map(self):
         manager = CapturingManager()
@@ -119,10 +133,128 @@ class OpenAIBrowserUseTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(2, len(manager.calls))
+        self.assertEqual([], manager.calls[1]["files"])
+        self.assertNotIn("DOM: <button", manager.calls[1]["prompt"])
         parsed = BrowserAgentOutput.model_validate_json(
             response.json()["choices"][0]["message"]["content"]
         )
         self.assertEqual(17, parsed.action[0].click_element["index"])
+
+    def test_structured_first_pass_valid_has_no_repair_and_preserves_schema(self):
+        expected = {
+            "thinking": "Inspect",
+            "evaluation_previous_goal": "Ready",
+            "memory": "Button visible",
+            "next_goal": "Click",
+            "action": [{"click_element": {"index": 17}}],
+        }
+        schema = BrowserAgentOutput.model_json_schema()
+        original_schema = copy.deepcopy(schema)
+        manager = CapturingManager(responses=[json.dumps(expected)])
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "click 17"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "browser_agent_output",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                },
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(manager.calls))
+        self.assertEqual(original_schema, schema)
+        self.assertIn(
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            manager.calls[0]["prompt"],
+        )
+
+    def test_invalid_after_one_repair_is_never_http_200(self):
+        manager = CapturingManager(responses=["not json", '{"wrong":true}'])
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "click 17"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "browser_agent_output",
+                            "strict": True,
+                            "schema": BrowserAgentOutput.model_json_schema(),
+                        },
+                    },
+                },
+            )
+
+        self.assertEqual(502, response.status_code)
+        self.assertEqual(
+            "STRUCTURED_OUTPUT_VALIDATION_FAILED",
+            response.json()["error"],
+        )
+        self.assertEqual(2, response.json()["details"]["attempts"])
+        self.assertEqual(2, len(manager.calls))
+
+    def test_fake_upstream_prose_empty_and_html_fail_without_repair(self):
+        outputs = [
+            "I encountered an error. Please try again.",
+            "",
+            "<!doctype html><html><body>Sign in</body></html>",
+        ]
+        for output in outputs:
+            manager = CapturingManager(responses=[output])
+            with self.subTest(output=output[:20]), patch.object(
+                app_module, "manager", manager
+            ):
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "gemini-web",
+                        "messages": [{"role": "user", "content": "return JSON"}],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+            self.assertEqual(502, response.status_code)
+            self.assertEqual("UPSTREAM_ERROR", response.json()["error"])
+            self.assertEqual(1, len(manager.calls))
+
+    def test_arbitrary_prose_wrapping_json_requires_repair(self):
+        manager = CapturingManager(
+            responses=['Here is the result: {"ok":true}', '{"ok":true}']
+        )
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "return JSON"}],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(manager.calls))
+
+    def test_known_error_phrase_inside_valid_json_is_not_reclassified(self):
+        manager = CapturingManager(responses=['{"message":"Please try again"}'])
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "return JSON"}],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(manager.calls))
 
     def test_json_object_strips_markdown_and_thinking_wrapper(self):
         manager = CapturingManager(
@@ -239,6 +371,87 @@ class OpenAIBrowserUseTests(unittest.TestCase):
         call = payload["choices"][0]["message"]["tool_calls"][0]
         self.assertEqual("click_element", call["function"]["name"])
         self.assertEqual(17, json.loads(call["function"]["arguments"])["index"])
+
+    def test_invalid_tool_name_repairs_once_against_caller_allowlist(self):
+        manager = CapturingManager(
+            responses=[
+                json.dumps(
+                    {"tool_calls": [{"name": "not_allowed", "arguments": {}}], "content": None}
+                ),
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {"name": "click_element", "arguments": {"index": 17}}
+                        ],
+                        "content": None,
+                    }
+                ),
+            ]
+        )
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "Click Continue"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "click_element",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"index": {"type": "integer"}},
+                                    "required": ["index"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+            )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(manager.calls))
+        self.assertEqual([], manager.calls[1]["files"])
+
+    def test_invalid_tool_arguments_after_repair_fail_non_2xx(self):
+        invalid = json.dumps(
+            {
+                "tool_calls": [
+                    {"name": "click_element", "arguments": {"index": "seventeen"}}
+                ],
+                "content": None,
+            }
+        )
+        manager = CapturingManager(responses=[invalid, invalid])
+        with patch.object(app_module, "manager", manager):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gemini-web",
+                    "messages": [{"role": "user", "content": "Click Continue"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "click_element",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"index": {"type": "integer"}},
+                                    "required": ["index"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+            )
+        self.assertEqual(502, response.status_code)
+        self.assertEqual(
+            "STRUCTURED_OUTPUT_VALIDATION_FAILED",
+            response.json()["error"],
+        )
 
     def test_tool_choice_auto_none_and_forced_are_supported(self):
         tool = {

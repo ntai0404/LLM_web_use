@@ -32,9 +32,31 @@ IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
 }
 
+OPENAI_OUTPUT_FORMAT_GUARD = """\
+<llm_web_output_format_guard>
+Do not create, infer, or substitute a new output format. Follow exactly the output format
+already required by the original OpenAI transcript for the current response. Treat those
+existing format instructions as mandatory: preserve their top-level and nested structure,
+and return no additional prose or wrappers unless that original format explicitly requires
+them. If a machine-readable response schema or function contract appears below, use it only
+as validation of the same original format, never as a different format. Before responding,
+silently check the answer against the original format requirements.
+</llm_web_output_format_guard>"""
+
 
 class OpenAIOutputError(RuntimeError):
-    pass
+    """Machine-readable failure produced by the upstream output pipeline."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: Literal["parse", "validation", "upstream", "tool"] = "validation",
+        errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.errors = errors or []
 
 
 class ImageURL(BaseModel):
@@ -383,6 +405,8 @@ def prepare_openai_request(request: ChatCompletionRequest) -> Iterator[PreparedO
             "without mentioning this serialization.\n\n<openai_messages_json>\n"
             + json.dumps(records, ensure_ascii=False, separators=(",", ":"))
             + "\n</openai_messages_json>"
+            + "\n\n"
+            + OPENAI_OUTPUT_FORMAT_GUARD
         )
 
         schema, require_object = _structured_config(request)
@@ -432,21 +456,76 @@ def prepare_openai_request(request: ChatCompletionRequest) -> Iterator[PreparedO
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+_UPSTREAM_FAILURE_PATTERNS = (
+    re.compile(r"\bi encountered an error\b", re.IGNORECASE),
+    re.compile(r"\bsomething went wrong\b", re.IGNORECASE),
+    re.compile(r"\bplease try again(?: later)?\b", re.IGNORECASE),
+    re.compile(r"\bsign in to continue\b", re.IGNORECASE),
+    re.compile(r"\bsession (?:has )?expired\b", re.IGNORECASE),
+)
+
+
+def detect_upstream_failure(text: str) -> str | None:
+    """Return a safe failure reason for obvious browser/upstream error output."""
+    cleaned = text.lstrip("\ufeff").strip()
+    if not cleaned:
+        return "upstream returned an empty response"
+    lowered = cleaned[:512].lower()
+    if lowered.startswith(("<!doctype html", "<html", "<head", "<body")):
+        return "upstream returned an HTML page instead of model output"
+    structured_candidate = re.sub(
+        r"^(?:<think>.*?</think>\s*)+",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).lstrip()
+    if structured_candidate.startswith(("{", "[", "```")):
+        return None
+    # Phrase matching is deliberately limited to short responses so legitimate
+    # long-form content mentioning an error is not reclassified.
+    if len(cleaned) <= 2_000:
+        for pattern in _UPSTREAM_FAILURE_PATTERNS:
+            if pattern.search(cleaned):
+                return "upstream returned a browser/provider failure message"
+    return None
+
+
 def parse_json_output(text: str) -> Any:
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    failure = detect_upstream_failure(text)
+    if failure:
+        raise OpenAIOutputError(failure, kind="upstream")
+
+    cleaned = text.lstrip("\ufeff").strip()
+    # Gemini occasionally emits a single leading thinking wrapper. Removing
+    # only complete leading wrappers remains deterministic and does not scrape
+    # arbitrary prose looking for a JSON fragment.
+    cleaned = re.sub(
+        r"^(?:<think>.*?</think>\s*)+",
+        "",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+    fence = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     if fence:
         cleaned = fence.group(1).strip()
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(cleaned):
-        if character not in "[{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(cleaned[index:])
-            return value
-        except json.JSONDecodeError:
-            continue
-    raise OpenAIOutputError("upstream did not return valid JSON")
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise OpenAIOutputError(
+            "upstream did not return exactly one valid JSON value",
+            kind="parse",
+            errors=[
+                {
+                    "path": [],
+                    "message": exc.msg,
+                    "validator": "json_parse",
+                }
+            ],
+        ) from exc
 
 
 def validate_structured_output(
@@ -457,10 +536,25 @@ def validate_structured_output(
     value = parse_json_output(text)
     if require_object and not isinstance(value, dict):
         raise OpenAIOutputError("upstream JSON response is not an object")
-    try:
-        validator_for(schema)(schema).validate(value)
-    except JsonSchemaValidationError as exc:
-        raise OpenAIOutputError(f"upstream JSON failed schema validation: {exc.message}") from exc
+    validator = validator_for(schema)(schema)
+    validation_errors = sorted(
+        validator.iter_errors(value),
+        key=lambda item: [str(part) for part in item.absolute_path],
+    )
+    if validation_errors:
+        details = [
+            {
+                "path": list(error.absolute_path),
+                "message": error.message,
+                "validator": str(error.validator),
+            }
+            for error in validation_errors
+        ]
+        raise OpenAIOutputError(
+            "upstream JSON failed schema validation",
+            kind="validation",
+            errors=details,
+        )
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -470,38 +564,46 @@ def validate_tool_output(
 ) -> tuple[str | None, list[dict[str, Any]] | None, Literal["stop", "tool_calls"]]:
     value = parse_json_output(text)
     if not isinstance(value, dict):
-        raise OpenAIOutputError("tool selection response must be a JSON object")
+        raise OpenAIOutputError("tool selection response must be a JSON object", kind="tool")
     raw_calls = value.get("tool_calls", [])
     if not isinstance(raw_calls, list):
-        raise OpenAIOutputError("tool_calls must be a list")
+        raise OpenAIOutputError("tool_calls must be a list", kind="tool")
     if plan.mode in {"required", "forced"} and not raw_calls:
-        raise OpenAIOutputError("tool_choice requires a function call")
+        raise OpenAIOutputError("tool_choice requires a function call", kind="tool")
     if not plan.parallel and len(raw_calls) > 1:
-        raise OpenAIOutputError("parallel_tool_calls=false allows at most one call")
+        raise OpenAIOutputError("parallel_tool_calls=false allows at most one call", kind="tool")
 
     calls: list[dict[str, Any]] = []
     for raw_call in raw_calls:
         if not isinstance(raw_call, dict):
-            raise OpenAIOutputError("tool call must be an object")
+            raise OpenAIOutputError("tool call must be an object", kind="tool")
         name = raw_call.get("name")
         if name not in plan.definitions:
-            raise OpenAIOutputError("upstream selected a function outside the allowlist")
+            raise OpenAIOutputError("upstream selected a function outside the allowlist", kind="tool")
         if plan.forced_name is not None and name != plan.forced_name:
-            raise OpenAIOutputError("upstream did not select the forced function")
+            raise OpenAIOutputError("upstream did not select the forced function", kind="tool")
         arguments = raw_call.get("arguments", {})
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError as exc:
-                raise OpenAIOutputError("tool arguments are not valid JSON") from exc
+                raise OpenAIOutputError("tool arguments are not valid JSON", kind="tool") from exc
         if not isinstance(arguments, dict):
-            raise OpenAIOutputError("tool arguments must be a JSON object")
+            raise OpenAIOutputError("tool arguments must be a JSON object", kind="tool")
         definition = plan.definitions[name]
         try:
             validator_for(definition.parameters)(definition.parameters).validate(arguments)
         except JsonSchemaValidationError as exc:
             raise OpenAIOutputError(
-                f"tool arguments failed schema validation: {exc.message}"
+                "tool arguments failed schema validation",
+                kind="tool",
+                errors=[
+                    {
+                        "path": list(exc.absolute_path),
+                        "message": exc.message,
+                        "validator": str(exc.validator),
+                    }
+                ],
             ) from exc
         calls.append(
             {
@@ -520,16 +622,58 @@ def validate_tool_output(
         return None, calls, "tool_calls"
     content = value.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise OpenAIOutputError("automatic tool response returned neither calls nor content")
+        raise OpenAIOutputError(
+            "automatic tool response returned neither calls nor content",
+            kind="tool",
+        )
     return content.strip(), None, "stop"
 
 
-def repair_prompt(prompt: str, invalid_output: str, reason: str) -> str:
-    clipped = invalid_output[:8000]
+def repair_prompt(
+    invalid_output: str,
+    failure: OpenAIOutputError,
+    *,
+    schema: dict[str, Any] | None,
+    tool_plan: ToolPlan | None,
+) -> str:
+    """Build one bounded repair request without replaying DOM or screenshots."""
+    if schema is not None:
+        contract: dict[str, Any] = {"json_schema": schema}
+    elif tool_plan is not None:
+        contract = {
+            "tool_choice": {
+                "mode": tool_plan.mode,
+                "forced_name": tool_plan.forced_name,
+                "parallel": tool_plan.parallel,
+            },
+            "tools": [
+                {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "parameters": definition.parameters,
+                }
+                for definition in tool_plan.definitions.values()
+            ],
+            "output_shape": {
+                "type": "object",
+                "required": ["tool_calls", "content"],
+            },
+        }
+    else:  # pragma: no cover - guarded by the structured request pipeline
+        raise ValueError("repair requires a JSON schema or tool plan")
+
+    errors = failure.errors or [
+        {"path": [], "message": str(failure), "validator": failure.kind}
+    ]
     return (
-        prompt
-        + "\n\nThe previous response was invalid: "
-        + reason
-        + "\nRepair it now. Return only the required JSON value. Previous response:\n"
-        + clipped
+        "The previous model output did not satisfy the caller's required contract.\n"
+        "Return exactly one corrected JSON value. Do not include explanations, Markdown, "
+        "code fences, or thinking. Do not invent, rename, or remove fields.\n\n"
+        "<invalid_output>\n"
+        + invalid_output[:8_000]
+        + "\n</invalid_output>\n\n<validation_errors_json>\n"
+        + json.dumps(errors, ensure_ascii=False, separators=(",", ":"))
+        + "\n</validation_errors_json>\n\n<required_contract_json>\n"
+        + json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
+        + "\n</required_contract_json>"
     )

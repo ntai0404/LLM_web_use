@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import logging
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -47,6 +49,36 @@ WEB_DIR = PROJECT_DIR / "web"
 STATIC_DIR = WEB_DIR / "static"
 TEMPLATE_DIR = WEB_DIR / "templates"
 settings = Settings.from_env()
+logger = logging.getLogger("llm_web.api")
+
+
+class StructuredOutputMetrics:
+    """Small process-local telemetry for the structured response boundary."""
+
+    _COUNTERS = (
+        "structured_requests",
+        "first_pass_valid",
+        "repaired",
+        "failed_validation",
+        "upstream_errors",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values = {name: 0 for name in self._COUNTERS}
+
+    def increment(self, name: str) -> None:
+        if name not in self._values:
+            raise ValueError(f"unknown structured output metric: {name}")
+        with self._lock:
+            self._values[name] += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {**self._values, "invalid_http_200": 0}
+
+
+structured_output_metrics = StructuredOutputMetrics()
 
 
 def build_manager(config: Settings) -> tuple[ProviderManager, ProviderScheduler]:
@@ -366,7 +398,9 @@ async def dashboard():
     description="Returns provider auth/runtime state for service consumers.",
 )
 async def health():
-    return await manager.health_check()
+    payload = await manager.health_check()
+    payload["structured_output"] = structured_output_metrics.snapshot()
+    return payload
 
 
 @app.get("/api/providers", summary="Discover registered providers")
@@ -480,19 +514,18 @@ async def estimate(request: GenerateRequest):
     description="Supports non-streaming text messages routed through ProviderManager.",
     responses=ERROR_RESPONSES,
 )
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, http_request: Request):
+    request_id = request_id_for(http_request)
+    started = time.perf_counter()
+    structured = False
+    first_pass_valid = False
+    repair_attempted = False
+    validation_result = "not_requested"
     try:
         with prepare_openai_request(request) as prepared:
-            result = await manager.generate(
-                prepared.prompt,
-                request.model,
-                files=prepared.files,
-                max_input_tokens=request.max_input_tokens,
-                max_output_tokens=request.output_token_limit,
-            )
-            content: str | None = result.text
-            tool_calls: list[dict[str, Any]] | None = None
-            finish_reason: Literal["stop", "tool_calls"] = "stop"
+            structured = prepared.tool_plan is not None or prepared.output_schema is not None
+            if structured:
+                structured_output_metrics.increment("structured_requests")
 
             def validate_output(text: str):
                 if prepared.tool_plan is not None:
@@ -509,35 +542,108 @@ async def chat_completions(request: ChatCompletionRequest):
                     )
                 return text, None, "stop"
 
-            if prepared.tool_plan is not None or prepared.output_schema is not None:
-                try:
-                    content, tool_calls, finish_reason = validate_output(result.text)
-                except OpenAIOutputError as first_error:
-                    repaired = await manager.generate(
-                        repair_prompt(
+            total_timeout = max(0.001, settings.gemini_timeout_ms / 1000)
+            try:
+                async with asyncio.timeout(total_timeout):
+                    async with manager.generation_session(request.model) as generate:
+                        result = await generate(
                             prepared.prompt,
-                            result.text,
-                            str(first_error),
-                        ),
-                        request.model,
-                        files=prepared.files,
-                        max_input_tokens=request.max_input_tokens,
-                        max_output_tokens=request.output_token_limit,
-                    )
-                    try:
-                        content, tool_calls, finish_reason = validate_output(repaired.text)
-                    except OpenAIOutputError as second_error:
-                        raise ApiException(
-                            502,
-                            "MALFORMED_UPSTREAM_OUTPUT",
-                            str(second_error),
-                        ) from second_error
+                            request.model,
+                            files=prepared.files,
+                            max_input_tokens=request.max_input_tokens,
+                            max_output_tokens=request.output_token_limit,
+                        )
+                        content: str | None = result.text
+                        tool_calls: list[dict[str, Any]] | None = None
+                        finish_reason: Literal["stop", "tool_calls"] = "stop"
+
+                        if structured:
+                            try:
+                                content, tool_calls, finish_reason = validate_output(result.text)
+                            except OpenAIOutputError as first_error:
+                                if first_error.kind == "upstream":
+                                    structured_output_metrics.increment("upstream_errors")
+                                    validation_result = "upstream_error"
+                                    raise ApiException(
+                                        502,
+                                        "UPSTREAM_ERROR",
+                                        str(first_error),
+                                        {"attempts": 1},
+                                    ) from first_error
+
+                                repair_attempted = True
+                                repaired = await generate(
+                                    repair_prompt(
+                                        result.text,
+                                        first_error,
+                                        schema=prepared.output_schema,
+                                        tool_plan=prepared.tool_plan,
+                                    ),
+                                    request.model,
+                                    # Repair deliberately excludes original DOM/images.
+                                    files=None,
+                                    max_input_tokens=request.max_input_tokens,
+                                    max_output_tokens=request.output_token_limit,
+                                )
+                                try:
+                                    content, tool_calls, finish_reason = validate_output(repaired.text)
+                                except OpenAIOutputError as second_error:
+                                    if second_error.kind == "upstream":
+                                        structured_output_metrics.increment("upstream_errors")
+                                        validation_result = "upstream_error"
+                                        error_code = "UPSTREAM_ERROR"
+                                    else:
+                                        structured_output_metrics.increment("failed_validation")
+                                        validation_result = "failed_validation"
+                                        error_code = "STRUCTURED_OUTPUT_VALIDATION_FAILED"
+                                    raise ApiException(
+                                        502,
+                                        error_code,
+                                        str(second_error),
+                                        {
+                                            "attempts": 2,
+                                            "validation_errors": second_error.errors,
+                                        },
+                                    ) from second_error
+                                structured_output_metrics.increment("repaired")
+                                validation_result = "repaired"
+                            else:
+                                structured_output_metrics.increment("first_pass_valid")
+                                first_pass_valid = True
+                                validation_result = "first_pass_valid"
+            except TimeoutError as exc:
+                raise ProviderTimeout(
+                    f"LLM-Web request exceeded total deadline of {total_timeout:g} seconds"
+                ) from exc
     except Exception as exc:
+        if structured and isinstance(exc, ProviderError):
+            structured_output_metrics.increment("upstream_errors")
+            validation_result = "upstream_error"
+        logger.info(
+            "request_id=%s provider=gemini-web structured=%s first_pass_valid=%s "
+            "repair_attempted=%s validation_result=%s latency_seconds=%.3f",
+            request_id,
+            structured,
+            first_pass_valid,
+            repair_attempted,
+            validation_result,
+            time.perf_counter() - started,
+        )
         if isinstance(exc, ApiException):
             raise
         raise provider_http_error(exc)
+    logger.info(
+        "request_id=%s provider=gemini-web structured=%s first_pass_valid=%s "
+        "repair_attempted=%s validation_result=%s latency_seconds=%.3f",
+        request_id,
+        structured,
+        first_pass_valid,
+        repair_attempted,
+        validation_result,
+        time.perf_counter() - started,
+    )
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "id": f"chatcmpl-{request_id[:24]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": request.model,

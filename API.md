@@ -124,11 +124,20 @@ Remote HTTP/HTTPS image URLs are rejected and never downloaded.
 ## Structured output
 
 Both `{"type":"json_object"}` and OpenAI-style `json_schema` response formats
-are supported. The schema is added to the provider prompt, Markdown/thinking
-wrappers are removed, JSON is parsed and validated server-side, and at most one
-repair generation is attempted. A successful response always exposes valid
-JSON in `message.content`; repeated malformed output returns
-`502 MALFORMED_UPSTREAM_OUTPUT`.
+are supported. For `json_schema`, the caller-provided schema is preserved,
+added to the format reinforcement, and used directly for server-side
+validation. Plain JSON and a single JSON/generic Markdown fence are accepted;
+arbitrary prose is not scraped for embedded JSON. At most one bounded repair
+generation is attempted without replaying the original DOM or images. First
+pass and repair remain serialized in one provider request lifecycle.
+
+A structured HTTP 200 response always validates against the caller schema.
+Repeated malformed output returns
+`502 STRUCTURED_OUTPUT_VALIDATION_FAILED`; an empty/HTML/known browser error
+response returns `502 UPSTREAM_ERROR`, allowing the caller's provider fallback
+to run. Normal requests without `response_format` keep the existing text
+behavior. Aggregate safe counters are exposed as `structured_output` in
+`GET /health`.
 
 ## Function tools
 
@@ -213,7 +222,7 @@ Important implementation codes:
 | 404 | `NOT_FOUND`, `PROVIDER_NOT_FOUND` |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `VALIDATION_ERROR`, `INVALID_REQUEST` |
-| 502 | `UPSTREAM_ERROR`, `MALFORMED_UPSTREAM_OUTPUT`, `KEEPALIVE_FAILED`, `PROVIDER_TEST_FAILED` |
+| 502 | `UPSTREAM_ERROR`, `STRUCTURED_OUTPUT_VALIDATION_FAILED`, `KEEPALIVE_FAILED`, `PROVIDER_TEST_FAILED` |
 | 503 | `PROVIDER_UNAVAILABLE`, `PROVIDER_BUSY` |
 | 504 | `GENERATION_TIMEOUT` |
 | 500 | `INTERNAL_ERROR` |

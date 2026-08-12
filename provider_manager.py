@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import secrets
 import time
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from providers.base import GenerationResult, LLMProvider
 
@@ -60,6 +61,16 @@ class ProviderManager:
     ) -> GenerationResult:
         provider = self.registry.resolve(model)
         return await provider.generate(prompt, model, files=files, **options)
+
+    @asynccontextmanager
+    async def generation_session(
+        self,
+        model: str | None,
+    ) -> AsyncIterator[Callable[..., Awaitable[GenerationResult]]]:
+        """Serialize a first pass and its optional repair as one request."""
+        provider = self.registry.resolve(model)
+        async with provider.generation_session() as generate:
+            yield generate
 
     async def estimate(
         self,

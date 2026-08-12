@@ -1,10 +1,9 @@
 import asyncio
 import importlib
 import unittest
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
-
-from fastapi.testclient import TestClient
 
 import app as app_module
 from providers import (
@@ -12,6 +11,7 @@ from providers import (
     ProviderAuthRequired,
     ProviderTimeout,
 )
+from tests.asgi_client import ASGITestClient
 
 
 class FakeManager:
@@ -27,6 +27,18 @@ class FakeManager:
             provider="gemini-web",
             metadata={"browser_request": True},
         )
+
+    @asynccontextmanager
+    async def generation_session(self, model):
+        async def generate(prompt, session_model=None, files=None, **options):
+            return await self.generate(
+                prompt,
+                session_model or model,
+                files=files,
+                **options,
+            )
+
+        yield generate
 
 
 class SlowGeminiClient:
@@ -46,7 +58,7 @@ class SlowGeminiClient:
 class ApiContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app_module.app)
+        cls.client = ASGITestClient(app_module.app)
 
     def test_openapi_hides_local_ops_and_legacy_alias(self):
         paths = app_module.app.openapi()["paths"]

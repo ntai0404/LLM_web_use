@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, AsyncIterator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 
@@ -113,6 +114,29 @@ class LLMProvider(ABC):
         **options: Any,
     ) -> GenerationResult:
         raise NotImplementedError
+
+    @asynccontextmanager
+    async def generation_session(
+        self,
+    ) -> AsyncIterator[
+        Callable[..., Awaitable[GenerationResult]]
+    ]:
+        """Keep related generation calls in one logical provider lifecycle.
+
+        Providers without a shared conversational runtime may use this default.
+        Browser-backed providers override it to hold their serialization lock
+        across first-pass generation and the optional repair call.
+        """
+
+        async def generate_in_session(
+            prompt: str,
+            model: str | None = None,
+            files: list[str] | None = None,
+            **options: Any,
+        ) -> GenerationResult:
+            return await self.generate(prompt, model, files=files, **options)
+
+        yield generate_in_session
 
     @abstractmethod
     async def health_check(self) -> dict[str, Any]:

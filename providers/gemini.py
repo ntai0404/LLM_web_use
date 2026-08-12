@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from gemini_web import AuthRequired, BrowserUnavailable, GeminiWebClient, GeminiWebError
@@ -153,6 +154,14 @@ class GeminiWebProvider(LLMProvider):
         files: list[str] | None = None,
         **options: Any,
     ) -> GenerationResult:
+        async with self.generation_session() as generate:
+            return await generate(prompt, model, files=files, **options)
+
+    @asynccontextmanager
+    async def generation_session(
+        self,
+    ) -> AsyncIterator[Callable[..., Awaitable[GenerationResult]]]:
+        """Hold the browser lock across first-pass and bounded repair calls."""
         try:
             await asyncio.wait_for(
                 self._operation_lock.acquire(),
@@ -162,8 +171,17 @@ class GeminiWebProvider(LLMProvider):
             raise ProviderBusy(
                 f"Gemini browser queue remained busy for {self.queue_timeout_seconds:g} seconds"
             ) from exc
-        try:
+
+        async def generate_in_session(
+            prompt: str,
+            model: str | None = None,
+            files: list[str] | None = None,
+            **options: Any,
+        ) -> GenerationResult:
             return await self._generate_locked(prompt, model, files, options)
+
+        try:
+            yield generate_in_session
         finally:
             self._operation_lock.release()
 

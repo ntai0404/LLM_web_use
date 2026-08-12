@@ -174,6 +174,24 @@ class ProviderSystemTests(unittest.IsolatedAsyncioTestCase):
         finally:
             provider._operation_lock.release()
 
+    async def test_generation_session_keeps_repair_before_next_request(self):
+        client = FakeGeminiClient()
+        provider = GeminiWebProvider(client)
+
+        async with provider.generation_session() as generate:
+            first = await generate("FIRST", "gemini-web")
+            queued = asyncio.create_task(provider.generate("NEXT", "gemini-web"))
+            await asyncio.sleep(0)
+            repaired = await generate("REPAIR", "gemini-web")
+
+        next_result = await queued
+
+        self.assertEqual("USER_OK", first.text)
+        self.assertEqual("USER_OK", repaired.text)
+        self.assertEqual("USER_OK", next_result.text)
+        self.assertEqual(["FIRST", "REPAIR", "NEXT"], client.prompts)
+        self.assertEqual(1, client.max_active)
+
     async def test_manager_shutdown_closes_provider_once(self):
         registry = ProviderRegistry()
         provider = FakeProvider()
