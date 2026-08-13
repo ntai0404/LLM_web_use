@@ -97,6 +97,8 @@ def build_manager(config: Settings) -> tuple[ProviderManager, ProviderScheduler]
         ),
         operation_timeout_seconds=config.gemini_timeout_ms / 1000,
         queue_timeout_seconds=config.gemini_queue_timeout_ms / 1000,
+        upstream_max_attempts=config.gemini_upstream_max_attempts,
+        upstream_retry_base_seconds=config.gemini_upstream_retry_base_seconds,
     )
     registry.register(gemini)
     manager = ProviderManager(registry)
@@ -542,9 +544,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     )
                 return text, None, "stop"
 
-            total_timeout = max(0.001, settings.gemini_timeout_ms / 1000)
+            total_timeout = 200.0
             try:
-                async with asyncio.timeout(total_timeout):
+                async with asyncio.timeout(total_timeout) as request_timeout:
+                    request_deadline_monotonic = request_timeout.when()
                     async with manager.generation_session(request.model) as generate:
                         result = await generate(
                             prepared.prompt,
@@ -552,6 +555,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                             files=prepared.files,
                             max_input_tokens=request.max_input_tokens,
                             max_output_tokens=request.output_token_limit,
+                            _request_deadline_monotonic=request_deadline_monotonic,
                         )
                         content: str | None = result.text
                         tool_calls: list[dict[str, Any]] | None = None
@@ -584,6 +588,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                                     files=None,
                                     max_input_tokens=request.max_input_tokens,
                                     max_output_tokens=request.output_token_limit,
+                                    _request_deadline_monotonic=request_deadline_monotonic,
                                 )
                                 try:
                                     content, tool_calls, finish_reason = validate_output(repaired.text)

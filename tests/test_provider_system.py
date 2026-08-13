@@ -10,8 +10,12 @@ from providers.base import (
     LLMProvider,
     ProviderStatus,
     ProviderBusy,
+    ProviderAuthRequired,
+    ProviderError,
+    ProviderRateLimited,
 )
 from providers.gemini import GeminiWebProvider
+from gemini_web import AuthRequired, GeminiWebError
 from scheduler import ProviderScheduler
 
 
@@ -66,6 +70,7 @@ class FakeGeminiClient:
         self.last_observed_model_id = None
         self.last_call_metrics = {"duration_seconds": 0.01}
         self.stopped = False
+        self.scripted_outcomes = []
 
     async def ask(self, prompt, model=None, files=None, **options):
         self.active += 1
@@ -73,6 +78,11 @@ class FakeGeminiClient:
         self.prompts.append(prompt)
         await asyncio.sleep(0.02)
         self.active -= 1
+        if self.scripted_outcomes:
+            outcome = self.scripted_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         marker = "Reply exactly with this token and nothing else: "
         return prompt.split(marker, 1)[1] if marker in prompt else "USER_OK"
 
@@ -97,6 +107,103 @@ class FakeGeminiClient:
 
 
 class ProviderSystemTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unclassified_stream_error_is_retried_then_succeeds(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [GeminiWebError("Gemini stream error 1095"), "RECOVERED"]
+        provider = GeminiWebProvider(client, upstream_retry_base_seconds=0)
+
+        result = await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual("RECOVERED", result.text)
+        self.assertEqual(["PROMPT", "PROMPT"], client.prompts)
+        self.assertEqual(ProviderStatus.READY, provider.status)
+
+    async def test_stream_1095_uses_recovery_budget_beyond_generic_attempt_limit(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [
+            GeminiWebError("Gemini stream error 1095"),
+            GeminiWebError("Gemini stream error 1095"),
+            GeminiWebError("Gemini stream error 1095"),
+            "RECOVERED_AFTER_THREE_FAILURES",
+        ]
+        provider = GeminiWebProvider(
+            client,
+            upstream_max_attempts=3,
+            upstream_retry_base_seconds=0,
+            stream_1095_recovery_budget_seconds=1,
+        )
+
+        result = await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual("RECOVERED_AFTER_THREE_FAILURES", result.text)
+        self.assertEqual(4, len(client.prompts))
+
+    async def test_other_stream_code_keeps_generic_attempt_limit(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [
+            GeminiWebError("Gemini stream error 1096"),
+            GeminiWebError("Gemini stream error 1096"),
+            GeminiWebError("Gemini stream error 1096"),
+        ]
+        provider = GeminiWebProvider(client, upstream_retry_base_seconds=0)
+
+        with self.assertRaisesRegex(ProviderError, "Gemini stream error 1096"):
+            await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual(3, len(client.prompts))
+
+    async def test_stream_1095_budget_exhaustion_keeps_provider_error_mapping(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [GeminiWebError("Gemini stream error 1095")]
+        provider = GeminiWebProvider(
+            client,
+            upstream_retry_base_seconds=0.02,
+            stream_1095_recovery_budget_seconds=0.01,
+        )
+
+        with self.assertRaisesRegex(ProviderError, "Gemini stream error 1095"):
+            await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual(1, len(client.prompts))
+        self.assertEqual("GEMINI_WEB_ERROR", provider.last_error)
+
+    async def test_other_unclassified_upstream_errors_are_bounded(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [
+            GeminiWebError("unknown upstream A"),
+            GeminiWebError("unknown upstream B"),
+            GeminiWebError("unknown upstream C"),
+        ]
+        provider = GeminiWebProvider(client, upstream_retry_base_seconds=0)
+
+        with self.assertRaisesRegex(ProviderError, "unknown upstream C"):
+            await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual(3, len(client.prompts))
+        self.assertEqual("GEMINI_WEB_ERROR", provider.last_error)
+
+    async def test_rate_limit_keeps_existing_mapping_without_retry(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [GeminiWebError("StreamGenerate returned HTTP 429")]
+        provider = GeminiWebProvider(client, upstream_retry_base_seconds=0)
+
+        with self.assertRaises(ProviderRateLimited):
+            await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual(1, len(client.prompts))
+        self.assertEqual("RATE_LIMITED", provider.last_error)
+
+    async def test_auth_error_keeps_existing_mapping_without_retry(self):
+        client = FakeGeminiClient()
+        client.scripted_outcomes = [AuthRequired("login required")]
+        provider = GeminiWebProvider(client, upstream_retry_base_seconds=0)
+
+        with self.assertRaises(ProviderAuthRequired):
+            await provider.generate("PROMPT", "gemini-web")
+
+        self.assertEqual(1, len(client.prompts))
+        self.assertEqual("AUTH_REQUIRED", provider.last_error)
+
     async def test_registry_routes_model_without_core_provider_logic(self):
         registry = ProviderRegistry()
         provider = FakeProvider()

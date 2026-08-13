@@ -18,6 +18,8 @@ class Settings:
     gemini_profile_dir: str
     gemini_timeout_ms: int
     gemini_queue_timeout_ms: int
+    gemini_upstream_max_attempts: int
+    gemini_upstream_retry_base_seconds: float
     headless: bool
     keepalive_enabled: bool
     keepalive_timezone: str
@@ -36,6 +38,14 @@ class Settings:
             gemini_timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS", "120000")),
             gemini_queue_timeout_ms=int(
                 os.getenv("GEMINI_QUEUE_TIMEOUT_MS", "30000")
+            ),
+            gemini_upstream_max_attempts=max(
+                1,
+                int(os.getenv("GEMINI_UPSTREAM_MAX_ATTEMPTS", "3")),
+            ),
+            gemini_upstream_retry_base_seconds=max(
+                0.0,
+                float(os.getenv("GEMINI_UPSTREAM_RETRY_BASE_SECONDS", "1")),
             ),
             headless=env_bool("HEADLESS", True),
             keepalive_enabled=env_bool("GEMINI_KEEPALIVE_ENABLED", True),

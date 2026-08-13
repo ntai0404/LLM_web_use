@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -26,6 +27,10 @@ from providers.base import (
 
 
 ZONE_BANGKOK = ZoneInfo("Asia/Bangkok")
+logger = logging.getLogger("llm_web.providers.gemini")
+STREAM_1095_RECOVERY_BUDGET_SECONDS = 180.0
+STREAM_1095_REQUEST_MARGIN_SECONDS = 5.0
+STREAM_1095_MAX_BACKOFF_SECONDS = 15.0
 
 
 def utc_now() -> str:
@@ -61,6 +66,9 @@ class GeminiWebProvider(LLMProvider):
         nonce_factory: Callable[[], str] | None = None,
         operation_timeout_seconds: float = 120.0,
         queue_timeout_seconds: float = 30.0,
+        upstream_max_attempts: int = 3,
+        upstream_retry_base_seconds: float = 1.0,
+        stream_1095_recovery_budget_seconds: float = STREAM_1095_RECOVERY_BUDGET_SECONDS,
     ) -> None:
         self.client = client
         self.keepalive_policy = keepalive_policy or KeepalivePolicy(
@@ -74,6 +82,12 @@ class GeminiWebProvider(LLMProvider):
         )
         self.operation_timeout_seconds = max(0.001, operation_timeout_seconds)
         self.queue_timeout_seconds = max(0.001, queue_timeout_seconds)
+        self.upstream_max_attempts = max(1, upstream_max_attempts)
+        self.upstream_retry_base_seconds = max(0.0, upstream_retry_base_seconds)
+        self.stream_1095_recovery_budget_seconds = max(
+            0.0,
+            stream_1095_recovery_budget_seconds,
+        )
         self._operation_lock = asyncio.Lock()
         self.status = ProviderStatus.OFFLINE
         self.auth_state = "unknown"
@@ -89,53 +103,137 @@ class GeminiWebProvider(LLMProvider):
         files: list[str] | None,
         options: dict[str, Any],
     ) -> GenerationResult:
-        try:
-            text = await asyncio.wait_for(
-                self.client.ask(
+        text: str | None = None
+        attempt = 0
+        stream_1095_failures = 0
+        stream_1095_started_at: float | None = None
+        stream_1095_deadline: float | None = None
+        last_stream_1095_error: GeminiWebError | None = None
+        stream_1095_terminal_reason = "recovery_budget_exhausted"
+        loop = asyncio.get_running_loop()
+
+        while True:
+            if (
+                stream_1095_deadline is not None
+                and last_stream_1095_error is not None
+                and loop.time() >= stream_1095_deadline
+            ):
+                elapsed = loop.time() - (stream_1095_started_at or loop.time())
+                self.status = ProviderStatus.DEGRADED
+                self.last_error = "GEMINI_WEB_ERROR"
+                logger.warning(
+                    "Gemini stream:1095 recovery terminal: attempt=%s "
+                    "elapsed_seconds=%.3f remaining_budget_seconds=0.000 "
+                    "recovered=false terminal_reason=%s",
+                    stream_1095_failures,
+                    elapsed,
+                    stream_1095_terminal_reason,
+                )
+                raise ProviderError(str(last_stream_1095_error)) from last_stream_1095_error
+
+            attempt += 1
+            attempt_timeout_seconds: float | None = None
+            if stream_1095_deadline is not None:
+                attempt_timeout_seconds = max(0.001, stream_1095_deadline - loop.time())
+            try:
+                text = await self._generate_once(
                     prompt,
                     model,
-                    files=files,
-                    max_input_tokens=options.get("max_input_tokens"),
-                    max_output_tokens=options.get("max_output_tokens"),
-                ),
-                timeout=self.operation_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            self.status = ProviderStatus.DEGRADED
-            self.last_error = "GENERATION_TIMEOUT"
-            raise ProviderTimeout(
-                f"Gemini Web generation exceeded {self.operation_timeout_seconds:g} seconds"
-            ) from exc
-        except AuthRequired as exc:
-            self.status = ProviderStatus.AUTH_REQUIRED
-            self.auth_state = "required"
-            self.last_error = "AUTH_REQUIRED"
-            raise ProviderAuthRequired("Gemini Web login is required") from exc
-        except BrowserUnavailable as exc:
-            self.status = ProviderStatus.OFFLINE
-            self.last_error = "BROWSER_UNAVAILABLE"
-            raise ProviderUnavailable("Google Chrome CDP runtime is unavailable") from exc
-        except GeminiWebError as exc:
-            message = str(exc)
-            if re.search(r"(?:HTTP|status)\s*429\b", message, re.IGNORECASE) or re.search(
-                r"\b(rate.?limit|quota)\b", message, re.IGNORECASE
-            ):
-                self.status = ProviderStatus.DEGRADED
-                self.last_error = "RATE_LIMITED"
-                raise ProviderRateLimited(
-                    "Gemini Web rate limit reached",
-                    retry_after=self.client.last_retry_after,
-                ) from exc
-            self.status = ProviderStatus.DEGRADED
-            self.last_error = "GEMINI_WEB_ERROR"
-            raise ProviderError(message) from exc
-        except ValueError:
-            raise
-        except Exception as exc:
-            self.status = ProviderStatus.OFFLINE
-            self.last_error = "BROWSER_UNAVAILABLE"
-            raise ProviderUnavailable("Gemini Web browser runtime is unavailable") from exc
+                    files,
+                    options,
+                    attempt_timeout_seconds=attempt_timeout_seconds,
+                )
+                break
+            except GeminiWebError as exc:
+                if self._is_rate_limited(exc):
+                    self.status = ProviderStatus.DEGRADED
+                    self.last_error = "RATE_LIMITED"
+                    raise ProviderRateLimited(
+                        "Gemini Web rate limit reached",
+                        retry_after=self.client.last_retry_after,
+                    ) from exc
 
+                if self._is_stream_1095(exc):
+                    now = loop.time()
+                    stream_1095_failures += 1
+                    last_stream_1095_error = exc
+                    if stream_1095_started_at is None:
+                        stream_1095_started_at = now
+                        stream_1095_deadline = (
+                            now + self.stream_1095_recovery_budget_seconds
+                        )
+                        request_deadline = options.get("_request_deadline_monotonic")
+                        if isinstance(request_deadline, (int, float)):
+                            request_recovery_deadline = (
+                                float(request_deadline)
+                                - STREAM_1095_REQUEST_MARGIN_SECONDS
+                            )
+                            if request_recovery_deadline < stream_1095_deadline:
+                                stream_1095_deadline = request_recovery_deadline
+                                stream_1095_terminal_reason = (
+                                    "request_deadline_margin_exhausted"
+                                )
+
+                    assert stream_1095_started_at is not None
+                    assert stream_1095_deadline is not None
+                    elapsed = now - stream_1095_started_at
+                    remaining = max(0.0, stream_1095_deadline - now)
+                    if remaining <= 0:
+                        self.status = ProviderStatus.DEGRADED
+                        self.last_error = "GEMINI_WEB_ERROR"
+                        logger.warning(
+                            "Gemini stream:1095 recovery terminal: attempt=%s "
+                            "elapsed_seconds=%.3f remaining_budget_seconds=0.000 "
+                            "recovered=false terminal_reason=%s",
+                            stream_1095_failures,
+                            elapsed,
+                            stream_1095_terminal_reason,
+                        )
+                        raise ProviderError(str(exc)) from exc
+
+                    delay = min(
+                        self.upstream_retry_base_seconds
+                        * (2 ** (stream_1095_failures - 1)),
+                        STREAM_1095_MAX_BACKOFF_SECONDS,
+                        remaining,
+                    )
+                    logger.warning(
+                        "Gemini stream:1095 recovery retry: attempt=%s "
+                        "elapsed_seconds=%.3f remaining_budget_seconds=%.3f "
+                        "backoff_seconds=%.3f recovered=false",
+                        stream_1095_failures + 1,
+                        elapsed,
+                        remaining,
+                        delay,
+                    )
+                    if delay:
+                        await asyncio.sleep(delay)
+                    continue
+
+                if attempt >= self.upstream_max_attempts:
+                    self.status = ProviderStatus.DEGRADED
+                    self.last_error = "GEMINI_WEB_ERROR"
+                    raise ProviderError(str(exc)) from exc
+
+                delay = self.upstream_retry_base_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "Unclassified Gemini Web upstream error (%s); retrying attempt %s/%s after %.3fs",
+                    self._safe_error_signature(exc),
+                    attempt + 1,
+                    self.upstream_max_attempts,
+                    delay,
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+
+        assert text is not None
+        if stream_1095_started_at is not None:
+            logger.warning(
+                "Gemini stream:1095 recovery completed: attempt=%s "
+                "elapsed_seconds=%.3f recovered=true terminal_reason=success",
+                stream_1095_failures + 1,
+                loop.time() - stream_1095_started_at,
+            )
         self.status = ProviderStatus.READY
         self.auth_state = "ok"
         self.last_success = utc_now()
@@ -146,6 +244,81 @@ class GeminiWebProvider(LLMProvider):
             provider=self.name,
             metadata=dict(self.client.last_call_metrics),
         )
+
+    async def _generate_once(
+        self,
+        prompt: str,
+        model: str | None,
+        files: list[str] | None,
+        options: dict[str, Any],
+        attempt_timeout_seconds: float | None = None,
+    ) -> str:
+        timeout_seconds = self.operation_timeout_seconds
+        if attempt_timeout_seconds is not None:
+            timeout_seconds = min(timeout_seconds, attempt_timeout_seconds)
+        try:
+            return await asyncio.wait_for(
+                self.client.ask(
+                    prompt,
+                    model,
+                    files=files,
+                    max_input_tokens=options.get("max_input_tokens"),
+                    max_output_tokens=options.get("max_output_tokens"),
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            self.status = ProviderStatus.DEGRADED
+            self.last_error = "GENERATION_TIMEOUT"
+            raise ProviderTimeout(
+                f"Gemini Web generation exceeded {timeout_seconds:g} seconds"
+            ) from exc
+        except AuthRequired as exc:
+            self.status = ProviderStatus.AUTH_REQUIRED
+            self.auth_state = "required"
+            self.last_error = "AUTH_REQUIRED"
+            raise ProviderAuthRequired("Gemini Web login is required") from exc
+        except BrowserUnavailable as exc:
+            self.status = ProviderStatus.OFFLINE
+            self.last_error = "BROWSER_UNAVAILABLE"
+            raise ProviderUnavailable("Google Chrome CDP runtime is unavailable") from exc
+        except GeminiWebError:
+            raise
+        except ValueError:
+            raise
+        except Exception as exc:
+            self.status = ProviderStatus.OFFLINE
+            self.last_error = "BROWSER_UNAVAILABLE"
+            raise ProviderUnavailable("Gemini Web browser runtime is unavailable") from exc
+
+    @staticmethod
+    def _is_rate_limited(exc: GeminiWebError) -> bool:
+        message = str(exc)
+        return bool(
+            re.search(r"(?:HTTP|status)\s*429\b", message, re.IGNORECASE)
+            or re.search(r"\b(rate.?limit|quota)\b", message, re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _is_stream_1095(exc: GeminiWebError) -> bool:
+        return bool(
+            re.search(
+                r"\bGemini stream error\s+1095\b",
+                str(exc),
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _safe_error_signature(exc: GeminiWebError) -> str:
+        message = str(exc)
+        stream_code = re.search(r"Gemini stream error\s+([\w.-]+)", message, re.IGNORECASE)
+        if stream_code:
+            return f"stream:{stream_code.group(1)}"
+        http_code = re.search(r"(?:HTTP|status)\s*(\d{3})\b", message, re.IGNORECASE)
+        if http_code:
+            return f"http:{http_code.group(1)}"
+        return type(exc).__name__
 
     async def generate(
         self,
